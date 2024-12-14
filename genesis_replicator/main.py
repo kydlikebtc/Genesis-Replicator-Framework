@@ -20,6 +20,8 @@ from decision_engine.strategy_manager import StrategyManager
 from decision_engine.rule_engine import RuleEngine
 from foundation_services.blockchain_integration.chain_manager import ChainManager
 from foundation_services.event_system.event_router import EventRouter
+from scalability.cluster_manager import ClusterManager
+from scalability.resource_optimizer import ResourceOptimizer
 
 # Configure logging
 logging.basicConfig(
@@ -61,6 +63,10 @@ class GenesisReplicator:
             self.components["event_router"] = EventRouter()
             self.components["chain_manager"] = ChainManager()
 
+            # Initialize Scalability Components
+            self.components["cluster_manager"] = ClusterManager()
+            self.components["resource_optimizer"] = ResourceOptimizer()
+
             # Initialize Agent Core
             self.components["lifecycle_manager"] = LifecycleManager()
             self.components["resource_monitor"] = ResourceMonitor()
@@ -87,6 +93,10 @@ class GenesisReplicator:
             # Start Foundation Services
             await self.components["event_router"].start()
             await self.components["chain_manager"].start()
+
+            # Start Scalability Components
+            await self.components["cluster_manager"].start()
+            await self.components["resource_optimizer"].start()
 
             # Start Agent Core
             await self.components["lifecycle_manager"].start()
