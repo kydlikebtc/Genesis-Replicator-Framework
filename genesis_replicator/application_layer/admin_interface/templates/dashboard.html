@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Genesis Replicator - Dashboard</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+    <div class="container">
+        <nav class="sidebar">
+            <div class="logo">Genesis Replicator</div>
+            <ul class="nav-links">
+                <li class="active"><a href="/">Dashboard</a></li>
+                <li><a href="/agents">Agents</a></li>
+                <li><a href="/models">Models</a></li>
+                <li><a href="/config">Configuration</a></li>
+            </ul>
+        </nav>
+        <main class="content">
+            <h1>System Dashboard</h1>
+            <div class="metrics-grid">
+                <div class="metric-card">
+                    <h3>CPU Usage</h3>
+                    <p>{{ metrics.cpu_usage }}%</p>
+                </div>
+                <div class="metric-card">
+                    <h3>Memory Usage</h3>
+                    <p>{{ metrics.memory_usage }}%</p>
+                </div>
+                <div class="metric-card">
+                    <h3>Disk Usage</h3>
+                    <p>{{ metrics.disk_usage }}%</p>
+                </div>
+                <div class="metric-card">
+                    <h3>Active Agents</h3>
+                    <p>{{ metrics.agent_count }}</p>
+                </div>
+                <div class="metric-card">
+                    <h3>Active Models</h3>
+                    <p>{{ metrics.model_count }}</p>
+                </div>
+            </div>
+        </main>
+    </div>
+    <script src="/static/js/dashboard.js"></script>
+</body>
+</html>
