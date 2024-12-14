@@ -1,107 +1,147 @@
 """
-Event Router Module
+Event Router Implementation for Genesis Replicator Framework
 
-This module implements the core event routing system for the Genesis Replicator Framework.
-It provides functionality for event subscription, routing, and distribution.
+This module implements the core event routing system that enables communication
+between different components of the framework through a publish-subscribe pattern.
 """
-from typing import Any, Callable, Dict, List
-from dataclasses import dataclass
-from datetime import datetime
 
+from typing import Any, Callable, Dict, List, Optional, Set
+import logging
+import asyncio
+from dataclasses import dataclass, field
+
+logger = logging.getLogger(__name__)
 
 @dataclass
-class Event:
-    """Represents an event in the system."""
+class Subscription:
+    """Represents a subscription to an event type."""
+    callback: Callable
     event_type: str
-    data: Any
-    timestamp: datetime = datetime.utcnow()
-    priority: int = 0
-    source: str = ""
+    subscriber_id: str
 
-
+@dataclass
 class EventRouter:
     """
-    Implements event routing logic and manages subscription patterns.
-    Ensures reliable event delivery and distribution.
+    Core event routing system implementing the publish-subscribe pattern.
+
+    Handles event subscription, publishing, and routing between framework components.
     """
+    _subscriptions: Dict[str, Set[Subscription]] = field(default_factory=dict)
+    _running: bool = False
+    _event_queue: asyncio.Queue = field(default_factory=asyncio.Queue)
 
-    def __init__(self):
-        """Initialize the event router with empty subscribers dictionary."""
-        self.subscribers: Dict[str, List[Callable[[Event], None]]] = {}
-        self._active = True
+    async def start(self):
+        """Start the event router."""
+        if self._running:
+            logger.warning("Event router is already running")
+            return
 
-    def subscribe(self, event_type: str, handler: Callable[[Event], None]) -> bool:
+        self._running = True
+        logger.info("Event router started")
+
+    async def stop(self):
+        """Stop the event router."""
+        if not self._running:
+            logger.warning("Event router is not running")
+            return
+
+        self._running = False
+        logger.info("Event router stopped")
+
+    def subscribe(self, event_type: str, callback: Callable, subscriber_id: str) -> None:
         """
-        Subscribe a handler to a specific event type.
+        Subscribe to an event type.
 
         Args:
             event_type: Type of event to subscribe to
-            handler: Callback function to handle the event
-
-        Returns:
-            bool: True if subscription was successful
+            callback: Function to call when event occurs
+            subscriber_id: Unique identifier for the subscriber
         """
-        if event_type not in self.subscribers:
-            self.subscribers[event_type] = []
-        if handler not in self.subscribers[event_type]:
-            self.subscribers[event_type].append(handler)
-            return True
-        return False
+        if event_type not in self._subscriptions:
+            self._subscriptions[event_type] = set()
 
-    def unsubscribe(self, event_type: str, handler: Callable[[Event], None]) -> bool:
+        subscription = Subscription(callback, event_type, subscriber_id)
+        self._subscriptions[event_type].add(subscription)
+        logger.info(f"Added subscription for {event_type} from {subscriber_id}")
+
+    def unsubscribe(self, event_type: str, subscriber_id: str) -> None:
         """
-        Unsubscribe a handler from a specific event type.
+        Unsubscribe from an event type.
 
         Args:
             event_type: Type of event to unsubscribe from
-            handler: Handler to remove
-
-        Returns:
-            bool: True if unsubscription was successful
+            subscriber_id: Unique identifier for the subscriber
         """
-        if event_type in self.subscribers and handler in self.subscribers[event_type]:
-            self.subscribers[event_type].remove(handler)
-            return True
-        return False
+        if event_type not in self._subscriptions:
+            logger.warning(f"No subscriptions found for event type {event_type}")
+            return
 
-    def publish_event(self, event: Event) -> None:
+        self._subscriptions[event_type] = {
+            sub for sub in self._subscriptions[event_type]
+            if sub.subscriber_id != subscriber_id
+        }
+        logger.info(f"Removed subscription for {event_type} from {subscriber_id}")
+
+    async def publish(self, event_type: str, data: Any = None) -> None:
         """
         Publish an event to all subscribers.
 
         Args:
-            event: Event object containing event data and metadata
+            event_type: Type of event to publish
+            data: Data to send with the event
         """
-        if not self._active:
-            raise RuntimeError("Event router is not active")
+        if not self._running:
+            logger.error("Cannot publish event: Event router is not running")
+            return
 
-        if event.event_type in self.subscribers:
-            for handler in self.subscribers[event.event_type]:
-                try:
-                    handler(event)
-                except Exception as e:
-                    # In production, this should be logged and possibly retried
-                    print(f"Error handling event {event.event_type}: {str(e)}")
+        if event_type not in self._subscriptions:
+            logger.warning(f"No subscribers found for event type {event_type}")
+            return
 
-    def start(self) -> None:
-        """Activate the event router."""
-        self._active = True
+        await self._event_queue.put((event_type, data))
+        logger.debug(f"Published event {event_type}")
 
-    def stop(self) -> None:
-        """Deactivate the event router."""
-        self._active = False
+    async def process_events(self) -> None:
+        """Process events from the event queue."""
+        while self._running:
+            try:
+                event_type, data = await self._event_queue.get()
+                subscribers = self._subscriptions.get(event_type, set())
 
-    def clear_subscribers(self) -> None:
-        """Remove all subscribers."""
-        self.subscribers.clear()
+                for subscription in subscribers:
+                    try:
+                        await subscription.callback(data)
+                    except Exception as e:
+                        logger.error(f"Error in subscriber callback: {e}")
 
-    def get_subscriber_count(self, event_type: str) -> int:
+                self._event_queue.task_done()
+
+            except Exception as e:
+                logger.error(f"Error processing event: {e}")
+
+    def get_subscribers(self, event_type: Optional[str] = None) -> Dict[str, List[str]]:
         """
-        Get the number of subscribers for a specific event type.
+        Get all subscribers, optionally filtered by event type.
 
         Args:
-            event_type: Type of event to count subscribers for
+            event_type: Optional event type to filter by
 
         Returns:
-            int: Number of subscribers
+            Dictionary mapping event types to lists of subscriber IDs
         """
-        return len(self.subscribers.get(event_type, []))
+        result = {}
+
+        if event_type:
+            if event_type in self._subscriptions:
+                result[event_type] = [
+                    sub.subscriber_id
+                    for sub in self._subscriptions[event_type]
+                ]
+        else:
+            for evt_type, subscriptions in self._subscriptions.items():
+                result[evt_type] = [
+                    sub.subscriber_id
+                    for sub in subscriptions
+                ]
+
+        return result

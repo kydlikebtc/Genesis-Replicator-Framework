@@ -1,108 +1,120 @@
 """
-Tests for the Event Router module.
+Tests for the Event Router implementation.
 """
+
 import pytest
-from datetime import datetime
-from genesis_replicator.foundation_services.event_system.event_router import EventRouter, Event
+import asyncio
+from genesis_replicator.foundation_services.event_system.event_router import EventRouter
 
+@pytest.fixture
+def event_router():
+    """Create a new EventRouter instance for testing."""
+    return EventRouter()
 
-def test_event_creation():
-    """Test event object creation."""
-    event = Event(event_type="test", data={"key": "value"})
-    assert event.event_type == "test"
-    assert event.data == {"key": "value"}
-    assert isinstance(event.timestamp, datetime)
+@pytest.mark.asyncio
+async def test_start_stop(event_router):
+    """Test starting and stopping the event router."""
+    assert not event_router._running
 
+    await event_router.start()
+    assert event_router._running
 
-def test_subscribe_and_publish():
-    """Test subscribing to and publishing events."""
-    router = EventRouter()
-    received_events = []
+    await event_router.stop()
+    assert not event_router._running
 
-    def handler(event):
-        received_events.append(event)
+@pytest.mark.asyncio
+async def test_subscribe_unsubscribe(event_router):
+    """Test subscribing and unsubscribing from events."""
+    async def callback(data):
+        pass
 
-    # Subscribe to test event
-    router.subscribe("test_event", handler)
-    assert router.get_subscriber_count("test_event") == 1
+    event_router.subscribe("test_event", callback, "test_subscriber")
+    assert "test_event" in event_router._subscriptions
+    assert len(event_router._subscriptions["test_event"]) == 1
+
+    event_router.unsubscribe("test_event", "test_subscriber")
+    assert len(event_router._subscriptions["test_event"]) == 0
+
+@pytest.mark.asyncio
+async def test_publish_and_receive(event_router):
+    """Test publishing events and receiving them through subscribers."""
+    received_data = []
+
+    async def callback(data):
+        received_data.append(data)
+
+    await event_router.start()
+    event_router.subscribe("test_event", callback, "test_subscriber")
+
+    # Start event processing
+    process_task = asyncio.create_task(event_router.process_events())
 
     # Publish test event
-    test_event = Event(event_type="test_event", data="test_data")
-    router.publish_event(test_event)
+    test_data = {"message": "test"}
+    await event_router.publish("test_event", test_data)
 
-    assert len(received_events) == 1
-    assert received_events[0].event_type == "test_event"
-    assert received_events[0].data == "test_data"
+    # Wait for event processing
+    await asyncio.sleep(0.1)
 
+    # Stop event router and processing
+    await event_router.stop()
+    process_task.cancel()
 
-def test_unsubscribe():
-    """Test unsubscribing from events."""
-    router = EventRouter()
+    assert len(received_data) == 1
+    assert received_data[0] == test_data
 
-    def handler(event):
+@pytest.mark.asyncio
+async def test_multiple_subscribers(event_router):
+    """Test multiple subscribers receiving the same event."""
+    received_data_1 = []
+    received_data_2 = []
+
+    async def callback_1(data):
+        received_data_1.append(data)
+
+    async def callback_2(data):
+        received_data_2.append(data)
+
+    await event_router.start()
+    event_router.subscribe("test_event", callback_1, "subscriber_1")
+    event_router.subscribe("test_event", callback_2, "subscriber_2")
+
+    # Start event processing
+    process_task = asyncio.create_task(event_router.process_events())
+
+    # Publish test event
+    test_data = {"message": "test"}
+    await event_router.publish("test_event", test_data)
+
+    # Wait for event processing
+    await asyncio.sleep(0.1)
+
+    # Stop event router and processing
+    await event_router.stop()
+    process_task.cancel()
+
+    assert len(received_data_1) == 1
+    assert len(received_data_2) == 1
+    assert received_data_1[0] == test_data
+    assert received_data_2[0] == test_data
+
+@pytest.mark.asyncio
+async def test_get_subscribers(event_router):
+    """Test getting subscriber information."""
+    async def callback(data):
         pass
 
-    # Subscribe and then unsubscribe
-    router.subscribe("test_event", handler)
-    assert router.get_subscriber_count("test_event") == 1
+    event_router.subscribe("event1", callback, "subscriber1")
+    event_router.subscribe("event1", callback, "subscriber2")
+    event_router.subscribe("event2", callback, "subscriber3")
 
-    router.unsubscribe("test_event", handler)
-    assert router.get_subscriber_count("test_event") == 0
+    # Get all subscribers
+    all_subscribers = event_router.get_subscribers()
+    assert len(all_subscribers) == 2
+    assert len(all_subscribers["event1"]) == 2
+    assert len(all_subscribers["event2"]) == 1
 
-
-def test_multiple_subscribers():
-    """Test multiple subscribers for the same event."""
-    router = EventRouter()
-    count1 = count2 = 0
-
-    def handler1(event):
-        nonlocal count1
-        count1 += 1
-
-    def handler2(event):
-        nonlocal count2
-        count2 += 1
-
-    router.subscribe("test_event", handler1)
-    router.subscribe("test_event", handler2)
-
-    test_event = Event(event_type="test_event", data="test_data")
-    router.publish_event(test_event)
-
-    assert count1 == 1
-    assert count2 == 1
-
-
-def test_router_start_stop():
-    """Test router activation and deactivation."""
-    router = EventRouter()
-
-    # Router should be active by default
-    test_event = Event(event_type="test_event", data="test_data")
-    router.publish_event(test_event)  # Should not raise error
-
-    router.stop()
-    with pytest.raises(RuntimeError):
-        router.publish_event(test_event)
-
-    router.start()
-    router.publish_event(test_event)  # Should work again
-
-
-def test_clear_subscribers():
-    """Test clearing all subscribers."""
-    router = EventRouter()
-
-    def handler(event):
-        pass
-
-    router.subscribe("test_event1", handler)
-    router.subscribe("test_event2", handler)
-
-    assert router.get_subscriber_count("test_event1") == 1
-    assert router.get_subscriber_count("test_event2") == 1
-
-    router.clear_subscribers()
-
-    assert router.get_subscriber_count("test_event1") == 0
-    assert router.get_subscriber_count("test_event2") == 0
+    # Get subscribers for specific event
+    event1_subscribers = event_router.get_subscribers("event1")
+    assert len(event1_subscribers) == 1
+    assert len(event1_subscribers["event1"]) == 2

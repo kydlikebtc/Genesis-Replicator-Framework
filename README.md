@@ -1,100 +1,95 @@
 # Genesis Replicator Framework
 
-A comprehensive framework for developing autonomous AI agents in Web3 environments.
+A modular framework for developing autonomous AI agents in Web3 environments.
 
-## Project Structure
+## Overview
 
-```
-genesis_replicator/
-├── application_layer/
-│   ├── client_sdk.py
-│   ├── api_gateway.py
-│   ├── admin_interface.py
-├── agent_core/
-│   ├── lifecycle_manager.py
-│   ├── memory_manager.py
-│   ├── resource_monitor.py
-│   ├── agent_communicator.py
-├── decision_engine/
-│   ├── strategy_manager.py
-│   ├── rule_engine.py
-│   ├── priority_manager.py
-│   ├── history_analyzer.py
-├── ai_module/
-│   ├── model_registry.py
-│   ├── training_manager.py
-│   ├── prediction_optimizer.py
-│   ├── model_evaluator.py
-├── foundation_services/
-│   ├── blockchain_integration/
-│   │   ├── chain_manager.py
-│   │   ├── contract_manager.py
-│   │   ├── transaction_manager.py
-│   │   ├── sync_manager.py
-│   ├── event_system/
-│       ├── event_router.py
-│       ├── filter_chain.py
-│       ├── priority_queue.py
-│       ├── retry_manager.py
-├── main.py
-```
+The Genesis Replicator Framework provides a robust foundation for building, deploying, and managing autonomous AI agents that can interact with blockchain networks and Web3 services. The framework is designed with modularity and extensibility in mind, allowing developers to easily create custom agents while leveraging common infrastructure components.
 
-## System Architecture
+## Architecture
 
-The Genesis Replicator framework adopts a layered architecture consisting of five primary layers:
+The framework follows a layered architecture:
 
-1. **Application Layer**
-   - Client SDK
-   - API Gateway
-   - Admin Interface
-
-2. **Enhanced Agent Core**
-   - Lifecycle Manager
-   - Memory Manager
-   - Resource Monitor
-   - Agent Communicator
-
-3. **Enhanced Decision Engine**
-   - Strategy Manager
-   - Rule Engine
-   - Priority Manager
-   - History Analyzer
-
-4. **Enhanced AI Module**
-   - Model Registry
-   - Training Manager
-   - Prediction Optimizer
-   - Model Evaluator
-
-5. **Foundation Services Layer**
-   - Blockchain Integration
-     - Chain Manager
-     - Contract Manager
-     - Transaction Manager
-     - Sync Manager
+1. Foundation Services Layer
    - Event System
-     - Event Router
-     - Filter Chain
-     - Priority Queue
-     - Retry Manager
+   - Blockchain Integration
+   - Data Storage
+   - Configuration Management
 
-## Development Setup
+2. Core Module Layer
+   - Agent Core
+   - Decision Engine
+   - AI Module
+   - Task Management
 
-1. Create a Python virtual environment:
+3. Integration Layer
+   - Protocol Adapters
+   - External Services
+   - API Gateway
+
+4. Agent Layer
+   - Agent Implementation
+   - Behavior Models
+   - State Management
+
+5. Orchestration Layer
+   - Agent Coordination
+   - Resource Management
+   - Monitoring
+
+6. Interface Layer
+   - CLI
+   - Web Interface
+   - API Endpoints
+
+## Getting Started
+
+### Prerequisites
+
+- Python 3.9 or higher
+- Poetry for dependency management
+
+### Installation
+
+1. Clone the repository:
 ```bash
-python -m venv venv
-source venv/bin/activate  # On Unix/macOS
+git clone https://github.com/yourusername/genesis-replicator.git
+cd genesis-replicator
 ```
 
 2. Install dependencies:
 ```bash
-pip install -r requirements.txt
+poetry install
 ```
 
-## Contributing
+3. Run tests:
+```bash
+poetry run pytest
+```
 
-Please refer to the documentation for detailed information about each component and implementation guidelines.
+## Development
+
+### Project Structure
+
+```
+genesis_replicator/
+├── foundation_services/
+│   ├── event_system/
+│   ├── blockchain_integration/
+│   └── ...
+├── agent_core/
+├── ai_module/
+├── decision_engine/
+└── ...
+```
+
+### Contributing
+
+1. Create a new branch for your feature
+2. Make your changes
+3. Write tests
+4. Submit a pull request
 
 ## License
 
-[License details to be added]
+This project is licensed under the MIT License - see the LICENSE file for details.
