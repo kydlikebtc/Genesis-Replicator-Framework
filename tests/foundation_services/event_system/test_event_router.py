@@ -118,3 +118,108 @@ async def test_get_subscribers(event_router):
     event1_subscribers = event_router.get_subscribers("event1")
     assert len(event1_subscribers) == 1
     assert len(event1_subscribers["event1"]) == 2
+
+@pytest.mark.asyncio
+async def test_priority_handling(event_router):
+    """Test event handling with different priorities."""
+    received_order = []
+
+    async def callback_high(data):
+        received_order.append("high")
+
+    async def callback_medium(data):
+        received_order.append("medium")
+
+    async def callback_low(data):
+        received_order.append("low")
+
+    await event_router.start()
+    event_router.subscribe("test_event", callback_low, "low_priority", priority=3)
+    event_router.subscribe("test_event", callback_high, "high_priority", priority=1)
+    event_router.subscribe("test_event", callback_medium, "medium_priority", priority=2)
+
+    # Start event processing
+    process_task = asyncio.create_task(event_router.process_events())
+
+    # Publish test event
+    await event_router.publish("test_event", {"message": "test"})
+
+    # Wait for event processing
+    await asyncio.sleep(0.1)
+
+    # Stop event router and processing
+    await event_router.stop()
+    process_task.cancel()
+
+    assert received_order == ["high", "medium", "low"]
+
+@pytest.mark.asyncio
+async def test_error_handling(event_router):
+    """Test error handling during event processing."""
+    error_caught = False
+
+    async def failing_callback(data):
+        raise Exception("Test error")
+
+    async def error_handler(error, event_type, subscriber_id):
+        nonlocal error_caught
+        error_caught = True
+        assert isinstance(error, Exception)
+        assert error.args[0] == "Test error"
+        assert event_type == "test_event"
+        assert subscriber_id == "failing_subscriber"
+
+    await event_router.start()
+    event_router.set_error_handler(error_handler)
+    event_router.subscribe("test_event", failing_callback, "failing_subscriber")
+
+    # Start event processing
+    process_task = asyncio.create_task(event_router.process_events())
+
+    # Publish test event
+    await event_router.publish("test_event", {"message": "test"})
+
+    # Wait for event processing
+    await asyncio.sleep(0.1)
+
+    # Stop event router and processing
+    await event_router.stop()
+    process_task.cancel()
+
+    assert error_caught
+
+@pytest.mark.asyncio
+async def test_event_filtering(event_router):
+    """Test event filtering functionality."""
+    received_data = []
+
+    async def callback(data):
+        received_data.append(data)
+
+    def filter_func(data):
+        return data.get("value", 0) > 10
+
+    await event_router.start()
+    event_router.subscribe(
+        "test_event",
+        callback,
+        "filtered_subscriber",
+        filter_func=filter_func
+    )
+
+    # Start event processing
+    process_task = asyncio.create_task(event_router.process_events())
+
+    # Publish test events
+    await event_router.publish("test_event", {"value": 5})
+    await event_router.publish("test_event", {"value": 15})
+
+    # Wait for event processing
+    await asyncio.sleep(0.1)
+
+    # Stop event router and processing
+    await event_router.stop()
+    process_task.cancel()
+
+    assert len(received_data) == 1
+    assert received_data[0]["value"] == 15
