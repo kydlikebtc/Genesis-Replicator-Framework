@@ -1,0 +1,23 @@
+[tool.poetry]
+name = "genesis-replicator"
+version = "0.1.0"
+description = "Genesis Replicator Framework"
+authors = ["KYD"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.12"
+web3 = "^7.6.0"
+fastapi = "^0.115.6"
+pydantic = "^2.10.3"
+
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.3.4"
+black = "^24.10.0"
+isort = "^5.13.2"
+mypy = "^1.13.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
