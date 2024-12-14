@@ -1,0 +1,41 @@
+{
+    "foundation_services": {
+        "event_system": {
+            "max_retry_attempts": 3,
+            "retry_delay": 1000,
+            "queue_size": 1000
+        },
+        "blockchain_integration": {
+            "default_chain": "ethereum",
+            "sync_interval": 15,
+            "max_block_range": 1000
+        }
+    },
+    "agent_core": {
+        "max_agents": 100,
+        "memory_limit": 1024,
+        "resource_check_interval": 60
+    },
+    "decision_engine": {
+        "strategy_update_interval": 300,
+        "rule_evaluation_timeout": 5000,
+        "history_retention_days": 30
+    },
+    "application_layer": {
+        "api_gateway": {
+            "host": "0.0.0.0",
+            "port": 8000,
+            "rate_limit": 100
+        },
+        "admin_interface": {
+            "host": "0.0.0.0",
+            "port": 8001
+        }
+    },
+    "logging": {
+        "level": "INFO",
+        "file": "genesis_replicator.log",
+        "max_size": 10485760,
+        "backup_count": 5
+    }
+}
