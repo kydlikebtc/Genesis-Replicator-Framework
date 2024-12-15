@@ -5,9 +5,10 @@ This module manages smart contract interactions, deployment, and monitoring.
 """
 import asyncio
 import json
-from typing import Dict, List, Optional, Any
-from web3 import AsyncWeb3
+from typing import Dict, List, Optional, Any, AsyncGenerator
+from web3 import AsyncWeb3, Web3
 from web3.exceptions import Web3Exception, ContractLogicError
+from web3.types import BlockData
 
 from ...foundation_services.exceptions import (
     BlockchainError,
@@ -357,27 +358,34 @@ class ContractManager:
     async def send_transaction(
         self,
         chain_id: str,
-        web3: AsyncWeb3,
         contract_address: str,
         method_name: str,
-        *args,
+        args: Optional[List[Any]] = None,
+        gas_limit: Optional[int] = None,
+        gas_price: Optional[int] = None,
+        value: int = 0,
+        nonce: Optional[int] = None,
         **kwargs
     ) -> str:
-        """Send a transaction to a contract method.
+        """Send a contract transaction with gas estimation.
 
         Args:
             chain_id: Chain identifier
-            web3: Web3 instance for the chain
             contract_address: Contract address
             method_name: Method to call
-            *args: Method arguments
-            **kwargs: Additional transaction arguments
+            args: Method arguments
+            gas_limit: Optional gas limit override
+            gas_price: Optional gas price override
+            value: Amount of native currency to send
+            nonce: Optional nonce override
+            **kwargs: Additional transaction parameters
 
         Returns:
             Transaction hash
 
         Raises:
             ContractError: If transaction fails
+            SecurityError: If security validation fails
         """
         try:
             if contract_address not in self._contracts:
@@ -389,6 +397,7 @@ class ContractManager:
                     }
                 )
 
+            web3 = self._web3_instances[chain_id]
             contract_data = self._contracts[contract_address]
             contract = web3.eth.contract(
                 address=contract_address,
@@ -407,15 +416,48 @@ class ContractManager:
                 )
 
             # Build transaction
-            transaction = await method(*args).build_transaction(kwargs)
+            args = args or []
+            tx_params = {
+                'from': kwargs.get('from_address'),
+                'value': value
+            }
 
-            # Send transaction
-            tx_hash = await web3.eth.send_transaction(transaction)
+            # Estimate gas if not provided
+            if gas_limit is None:
+                gas_limit = await method(*args).estimate_gas(tx_params)
+                # Add 10% buffer for BNB Chain
+                if chain_id == 'bnb':
+                    gas_limit = int(gas_limit * 1.1)
+
+            tx_params['gas'] = gas_limit
+
+            # Get gas price if not provided
+            if gas_price is None:
+                gas_price = await web3.eth.gas_price
+                # Add 5% buffer for BNB Chain
+                if chain_id == 'bnb':
+                    gas_price = int(gas_price * 1.05)
+
+            tx_params['gasPrice'] = gas_price
+
+            # Get nonce if not provided
+            if nonce is None and 'from_address' in kwargs:
+                nonce = await web3.eth.get_transaction_count(
+                    kwargs['from_address'], 'pending'
+                )
+                tx_params['nonce'] = nonce
+
+            # Build and send transaction
+            tx = await method(*args).build_transaction(tx_params)
+            signed_tx = web3.eth.account.sign_transaction(
+                tx, private_key=kwargs.get('private_key')
+            )
+            tx_hash = await web3.eth.send_raw_transaction(signed_tx.rawTransaction)
             return tx_hash.hex()
 
         except ContractLogicError as e:
             raise ContractError(
-                f"Contract logic error in transaction: {str(e)}",
+                f"Contract logic error: {str(e)}",
                 details={
                     "chain_id": chain_id,
                     "contract_address": contract_address,
@@ -425,7 +467,7 @@ class ContractManager:
             )
         except Web3Exception as e:
             raise ContractError(
-                f"Web3 error in transaction: {str(e)}",
+                f"Web3 error sending transaction: {str(e)}",
                 details={
                     "chain_id": chain_id,
                     "contract_address": contract_address,
@@ -435,7 +477,7 @@ class ContractManager:
             )
         except Exception as e:
             raise ContractError(
-                f"Unexpected error in transaction: {str(e)}",
+                f"Unexpected error sending transaction: {str(e)}",
                 details={
                     "chain_id": chain_id,
                     "contract_address": contract_address,
@@ -447,29 +489,33 @@ class ContractManager:
     async def monitor_events(
         self,
         chain_id: str,
-        web3: AsyncWeb3,
         contract_address: str,
         event_name: str,
         from_block: Optional[int] = None,
         to_block: Optional[int] = None,
-        argument_filters: Optional[Dict[str, Any]] = None
-    ) -> asyncio.Task:
-        """Monitor contract events.
+        batch_size: int = 1000,
+        filters: Optional[Dict[str, Any]] = None,
+        retry_interval: int = 5,
+        max_retries: int = 3
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Monitor contract events with batching and error handling.
 
         Args:
             chain_id: Chain identifier
-            web3: Web3 instance for the chain
-            contract_address: Contract address
-            event_name: Event to monitor
-            from_block: Start block (default: latest)
-            to_block: End block (default: latest)
-            argument_filters: Event argument filters
+            contract_address: Contract address to monitor
+            event_name: Event name to monitor
+            from_block: Starting block number (default: latest - 1000)
+            to_block: Ending block number (default: latest)
+            batch_size: Number of blocks to process in each batch
+            filters: Event filter parameters
+            retry_interval: Seconds between retry attempts
+            max_retries: Maximum number of retry attempts
 
-        Returns:
-            Monitoring task
+        Yields:
+            Event data dictionaries
 
         Raises:
-            ContractError: If monitoring setup fails
+            ContractError: If event monitoring fails
         """
         try:
             if contract_address not in self._contracts:
@@ -481,13 +527,14 @@ class ContractManager:
                     }
                 )
 
+            web3 = self._web3_instances[chain_id]
             contract_data = self._contracts[contract_address]
             contract = web3.eth.contract(
                 address=contract_address,
                 abi=contract_data['abi']
             )
 
-            # Get event
+            # Get event object
             event = getattr(contract.events, event_name)
             if event is None:
                 raise ContractError(
@@ -498,43 +545,61 @@ class ContractManager:
                     }
                 )
 
-            # Create event filter
-            event_filter = await event.create_filter(
-                fromBlock=from_block,
-                toBlock=to_block,
-                argument_filters=argument_filters
-            )
+            # Set up monitoring parameters
+            latest_block = await web3.eth.block_number
+            start_block = from_block if from_block is not None else max(0, latest_block - 1000)
+            end_block = to_block if to_block is not None else latest_block
 
-
-            # Start monitoring task
+            # Process events in batches with retry logic
             async def monitor():
-                while True:
-                    try:
-                        events = await event_filter.get_new_entries()
-                        for event in events:
-                            # Process event (implement event handling logic)
-                            print(f"New event: {event}")
-                        await asyncio.sleep(2)  # Poll interval
-                    except Exception as e:
-                        print(f"Error polling events: {e}")
-                        await asyncio.sleep(5)  # Longer interval on error
+                current_block = start_block
+                while current_block <= end_block:
+                    batch_end = min(current_block + batch_size, end_block)
+                    retry_count = 0
 
-            task = asyncio.create_task(monitor())
-            return task
+                    while retry_count < max_retries:
+                        try:
+                            # Add chain-specific handling for BNB Chain
+                            if chain_id == 'bnb':
+                                # BNB Chain has different block time, adjust batch size
+                                adjusted_batch_size = min(batch_size, 100)
+                                batch_end = min(current_block + adjusted_batch_size, end_block)
 
-        except Web3Exception as e:
-            raise ContractError(
-                f"Web3 error setting up event monitor: {str(e)}",
-                details={
-                    "chain_id": chain_id,
-                    "contract_address": contract_address,
-                    "event_name": event_name,
-                    "error": str(e)
-                }
-            )
+                            events = await event.get_logs(
+                                fromBlock=current_block,
+                                toBlock=batch_end,
+                                argument_filters=filters
+                            )
+
+                            for evt in events:
+                                block = await web3.eth.get_block(evt.blockNumber)
+                                yield {
+                                    'event': event_name,
+                                    'args': dict(evt.args),
+                                    'block_number': evt.blockNumber,
+                                    'transaction_hash': evt.transactionHash.hex(),
+                                    'log_index': evt.logIndex,
+                                    'chain_id': chain_id,
+                                    'timestamp': block.timestamp,
+                                    'block_hash': evt.blockHash.hex()
+                                }
+                            break  # Success, exit retry loop
+
+                        except Exception as e:
+                            retry_count += 1
+                            if retry_count >= max_retries:
+                                print(f"Error processing events in block range {current_block}-{batch_end}: {str(e)}")
+                                break
+                            await asyncio.sleep(retry_interval)
+
+                    current_block = batch_end + 1
+
+            async for event_data in monitor():
+                yield event_data
+
         except Exception as e:
             raise ContractError(
-                f"Unexpected error setting up event monitor: {str(e)}",
+                f"Failed to monitor events: {str(e)}",
                 details={
                     "chain_id": chain_id,
                     "contract_address": contract_address,
