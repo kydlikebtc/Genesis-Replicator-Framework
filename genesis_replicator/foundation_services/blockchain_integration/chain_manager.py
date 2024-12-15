@@ -87,6 +87,35 @@ class ChainManager:
                 details={"chain_id": chain_id}
             )
 
+    async def validate_chain_credentials(
+        self,
+        chain_id: str,
+        credentials: Optional[Dict[str, Any]]
+    ) -> bool:
+        """Validate chain access credentials.
+
+        Args:
+            chain_id: Chain identifier
+            credentials: Security credentials
+
+        Returns:
+            True if credentials are valid, False otherwise
+
+        Raises:
+            SecurityError: If validation fails
+        """
+        try:
+            async with self._lock:
+                return self._verify_chain_access(chain_id, credentials)
+        except Exception as e:
+            raise SecurityError(
+                f"Failed to validate credentials for chain {chain_id}",
+                details={
+                    "chain_id": chain_id,
+                    "error": str(e)
+                }
+            )
+
     def _verify_chain_access(
         self,
         chain_id: str,
