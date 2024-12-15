@@ -4,13 +4,14 @@ Chain Manager for blockchain integration.
 This module manages multi-chain operations, network connections, and chain status monitoring.
 """
 import asyncio
-from typing import Dict, List, Any
+from typing import Dict, List, Optional, Any
 from web3 import AsyncWeb3
 from web3.exceptions import Web3Exception
 
 from ...foundation_services.exceptions import (
     ChainConnectionError,
-    TransactionError
+    TransactionError,
+    SecurityError
 )
 
 
@@ -38,6 +39,71 @@ class ChainManager:
             self._connections.clear()
             self._chain_configs.clear()
             self._status_monitors.clear()
+
+    async def stop(self) -> None:
+        """Stop and cleanup the chain manager."""
+        async with self._lock:
+            # Disconnect from all chains
+            for chain_id in list(self._connections.keys()):
+                await self.disconnect_from_chain(chain_id)
+            self._initialized = False
+
+    async def configure(self, config: Dict[str, Dict[str, Any]]) -> None:
+        """Configure chain manager with security settings.
+
+        Args:
+            config: Configuration dictionary with chain-specific settings
+
+        Raises:
+            SecurityError: If configuration is invalid
+        """
+        async with self._lock:
+            for chain_id, chain_config in config.items():
+                if 'permissions' not in chain_config:
+                    raise SecurityError(
+                        f"Missing permissions for chain {chain_id}",
+                        details={"chain_id": chain_id}
+                    )
+
+    async def connect_chain(
+        self,
+        chain_id: str,
+        credentials: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """Connect to a chain with security validation.
+
+        Args:
+            chain_id: Chain identifier
+            credentials: Optional security credentials
+
+        Raises:
+            SecurityError: If authentication fails
+        """
+        if not self._verify_chain_access(chain_id, credentials):
+            raise SecurityError(
+                "Unauthorized chain access",
+                details={"chain_id": chain_id}
+            )
+
+    def _verify_chain_access(
+        self,
+        chain_id: str,
+        credentials: Optional[Dict[str, Any]]
+    ) -> bool:
+        """Verify chain access permissions.
+
+        Args:
+            chain_id: Chain identifier
+            credentials: Security credentials
+
+        Returns:
+            True if access is allowed, False otherwise
+        """
+        # Implement actual security checks
+        # This is a placeholder - implement proper security validation
+        if not credentials:
+            return False
+        return 'role' in credentials and credentials['role'] == 'admin'
 
     async def connect_to_chain(self, chain_id: str, endpoint_url: str, **config) -> None:
         """Connect to a blockchain network.

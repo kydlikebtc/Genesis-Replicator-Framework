@@ -42,12 +42,26 @@ class SyncManager:
             self._sync_states.clear()
             self._reorg_monitors.clear()
             self._processed_blocks.clear()
+
+    async def stop(self) -> None:
+        """Stop and cleanup the sync manager.
+
+        This method should be called during shutdown.
+        """
+        async with self._lock:
+            # Stop all running syncs
+            for chain_id in list(self._sync_tasks.keys()):
+                await self.stop_sync(chain_id)
+
+            self._initialized = False
+
     async def start_sync(
         self,
         chain_id: str,
         web3: AsyncWeb3,
         start_block: Optional[int] = None,
-        batch_size: int = 100
+        batch_size: int = 100,
+        credentials: Optional[Dict[str, Any]] = None
     ) -> None:
         """Start blockchain synchronization.
 

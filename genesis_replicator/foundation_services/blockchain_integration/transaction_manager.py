@@ -12,7 +12,8 @@ from ...foundation_services.exceptions import (
     BlockchainError,
     ChainConnectionError,
     ContractError,
-    TransactionError
+    TransactionError,
+    SecurityError
 )
 
 
@@ -41,6 +42,14 @@ class TransactionManager:
             self._transaction_batches.clear()
             self._nonce_locks.clear()
 
+    async def stop(self) -> None:
+        """Stop and cleanup the transaction manager."""
+        async with self._lock:
+            self._pending_transactions.clear()
+            self._transaction_batches.clear()
+            self._nonce_locks.clear()
+            self._initialized = False
+
     async def submit_transaction(
         self,
         chain_id: str,
@@ -61,8 +70,19 @@ class TransactionManager:
 
         Raises:
             TransactionError: If transaction submission fails
+            SecurityError: If transaction validation fails
         """
         try:
+            # Validate transaction signature
+            if not self._validate_transaction_signature(transaction):
+                raise SecurityError(
+                    "Invalid transaction signature",
+                    details={
+                        "chain_id": chain_id,
+                        "transaction": transaction
+                    }
+                )
+
             # Get or create nonce lock for the sender
             sender = transaction.get('from', None)
             if not sender:
@@ -311,3 +331,29 @@ class TransactionManager:
                     "error": str(e)
                 }
             )
+
+    def _validate_transaction_signature(self, transaction: Dict[str, Any]) -> bool:
+        """Validate transaction signature.
+
+        Args:
+            transaction: Transaction data with signature
+
+        Returns:
+            True if signature is valid, False otherwise
+        """
+        # Implement actual signature validation
+        # This is a placeholder - implement proper validation
+        return 'signature' not in transaction or self._verify_signature(transaction)
+
+    def _verify_signature(self, transaction: Dict[str, Any]) -> bool:
+        """Verify transaction signature.
+
+        Args:
+            transaction: Transaction data with signature
+
+        Returns:
+            True if signature is valid, False otherwise
+        """
+        # Implement actual signature verification
+        # This is a placeholder - implement proper verification
+        return len(transaction.get('signature', '')) >= 64

@@ -15,7 +15,34 @@ from genesis_replicator.foundation_services.exceptions import SecurityError
 
 
 @pytest.fixture
-async def managers():
+async def web3_mock():
+    """Create a Web3 mock with proper eth attribute setup."""
+    mock = AsyncMock(spec=AsyncWeb3)
+    eth_mock = AsyncMock()
+
+    # Setup eth mock methods
+    eth_mock.get_transaction_count = AsyncMock(return_value=0)
+    eth_mock.send_transaction = AsyncMock(return_value=bytes.fromhex('123'))
+    eth_mock.wait_for_transaction_receipt = AsyncMock(return_value={'status': 1})
+    eth_mock.get_block = AsyncMock(return_value={'timestamp': 1234567890})
+    eth_mock.chain_id = AsyncMock(return_value=1)
+    eth_mock.block_number = AsyncMock(return_value=1000)
+    eth_mock.get_code = AsyncMock(return_value=bytes.fromhex('123456'))
+    eth_mock.contract = AsyncMock()
+
+    # Setup contract mock
+    contract_mock = AsyncMock()
+    contract_mock.constructor = AsyncMock()
+    contract_mock.constructor.return_value.build_transaction = AsyncMock(
+        return_value={'data': '0x123456'}
+    )
+    eth_mock.contract.return_value = contract_mock
+
+    mock.eth = eth_mock
+    return mock
+
+@pytest.fixture
+async def managers(web3_mock):
     """Create manager instances for testing."""
     sync_manager = SyncManager()
     tx_manager = TransactionManager()
@@ -24,16 +51,21 @@ async def managers():
 
     await sync_manager.start()
     await chain_manager.start()
+    await tx_manager.start()
+    await contract_manager.start()
 
     yield {
         'sync': sync_manager,
         'tx': tx_manager,
         'chain': chain_manager,
-        'contract': contract_manager
+        'contract': contract_manager,
+        'web3': web3_mock
     }
 
     await sync_manager.stop()
     await chain_manager.stop()
+    await tx_manager.stop()
+    await contract_manager.stop()
 
 
 @pytest.mark.asyncio
@@ -51,7 +83,7 @@ async def test_invalid_chain_access(managers):
 async def test_transaction_validation(managers):
     """Test transaction security validation."""
     tx_manager = managers['tx']
-    web3 = AsyncMock(spec=AsyncWeb3)
+    web3 = managers['web3']
 
     # Test transaction with invalid signature
     invalid_tx = {
@@ -70,7 +102,7 @@ async def test_transaction_validation(managers):
 async def test_contract_security(managers):
     """Test contract security measures."""
     contract_manager = managers['contract']
-    web3 = AsyncMock(spec=AsyncWeb3)
+    web3 = managers['web3']
 
     # Test deployment of malicious contract
     malicious_bytecode = "0x123456"  # Simulated malicious code
@@ -87,7 +119,7 @@ async def test_contract_security(managers):
 async def test_sync_authentication(managers):
     """Test sync process authentication."""
     sync_manager = managers['sync']
-    web3 = AsyncMock(spec=AsyncWeb3)
+    web3 = managers['web3']
 
     # Test sync with invalid credentials
     with pytest.raises(SecurityError) as exc_info:
@@ -104,7 +136,7 @@ async def test_sync_authentication(managers):
 async def test_rate_limiting(managers):
     """Test rate limiting protection."""
     tx_manager = managers['tx']
-    web3 = AsyncMock(spec=AsyncWeb3)
+    web3 = managers['web3']
 
     # Attempt rapid transactions
     tasks = []
@@ -121,7 +153,7 @@ async def test_rate_limiting(managers):
 async def test_input_sanitization(managers):
     """Test input sanitization."""
     contract_manager = managers['contract']
-    web3 = AsyncMock(spec=AsyncWeb3)
+    web3 = managers['web3']
 
     # Test with potentially malicious input
     malicious_input = "'; DROP TABLE contracts; --"

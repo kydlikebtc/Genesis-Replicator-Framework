@@ -13,6 +13,7 @@ from ...foundation_services.exceptions import (
     BlockchainError,
     ChainConnectionError,
     ContractError,
+    SecurityError,
     TransactionError
 )
 
@@ -26,6 +27,70 @@ class ContractManager:
         self._abis: Dict[str, Dict[str, Any]] = {}
         self._lock = asyncio.Lock()
         self._initialized = False
+
+    async def stop(self) -> None:
+        """Stop and cleanup the contract manager."""
+        async with self._lock:
+            self._contracts.clear()
+            self._abis.clear()
+            self._initialized = False
+
+    async def get_contract_state(
+        self,
+        chain_id: str,
+        contract_address: str,
+        sanitize: bool = True
+    ) -> Dict[str, Any]:
+        """Get contract state with input sanitization.
+
+        Args:
+            chain_id: Chain identifier
+            contract_address: Contract address
+            sanitize: Whether to sanitize inputs
+
+        Returns:
+            Contract state information
+
+        Raises:
+            SecurityError: If input validation fails
+            ContractError: If contract not found
+        """
+        if sanitize and not self._validate_input(contract_address):
+            raise SecurityError(
+                "Invalid input",
+                details={
+                    "chain_id": chain_id,
+                    "contract_address": contract_address
+                }
+            )
+
+        if contract_address not in self._contracts:
+            raise ContractError(
+                f"Contract not found: {contract_address}",
+                details={
+                    "chain_id": chain_id,
+                    "contract_address": contract_address
+                }
+            )
+
+        contract_data = self._contracts[contract_address]
+        return {
+            'address': contract_address,
+            'name': contract_data['name'],
+            'chain_id': contract_data['chain_id']
+        }
+
+    def _validate_input(self, input_str: str) -> bool:
+        """Validate and sanitize input strings.
+
+        Args:
+            input_str: Input string to validate
+
+        Returns:
+            True if input is valid, False otherwise
+        """
+        import re
+        return bool(re.match(r'^[0-9a-fA-F]{40}$', input_str.replace('0x', '')))
 
     async def deploy_contract(
         self,
