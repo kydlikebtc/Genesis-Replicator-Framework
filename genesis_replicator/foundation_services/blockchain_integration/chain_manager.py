@@ -8,10 +8,11 @@ from typing import Dict, List, Optional, Any, Type
 from web3 import AsyncWeb3
 from web3.exceptions import Web3Exception
 
-from ...foundation_services.exceptions import (
+from .exceptions import (
     ChainConnectionError,
     TransactionError,
-    SecurityError
+    SecurityError,
+    ConfigurationError
 )
 from .protocols.base import BaseProtocolAdapter
 from .protocols.bnb_chain import BNBChainAdapter
@@ -29,6 +30,7 @@ class ChainManager:
         self._connection_semaphore = asyncio.Semaphore(10)  # Limit concurrent connections
         self._connection_pool: Dict[str, List[AsyncWeb3]] = {}
         self._protocol_adapters: Dict[str, BaseProtocolAdapter] = {}
+        self._health_metrics: Dict[str, Dict[str, Any]] = {}  # Store health metrics
         self._initialized = False
 
     async def start(self) -> None:
@@ -74,31 +76,54 @@ class ChainManager:
         async with self._lock:
             self._protocol_adapters[chain_type] = adapter
 
-    async def configure(self, config: Dict[str, Dict[str, Any]]) -> None:
-        """Configure chain manager with security settings.
+    async def configure(self, chain_id: str, config: Dict[str, Any]) -> None:
+        """Configure chain connection parameters.
 
         Args:
-            config: Configuration dictionary with chain-specific settings
+            chain_id: Chain identifier
+            config: Configuration parameters
 
         Raises:
-            SecurityError: If configuration is invalid
+            ConfigurationError: If configuration is invalid
         """
-        async with self._lock:
-            for chain_id, chain_config in config.items():
-                if 'permissions' not in chain_config:
-                    raise SecurityError(
-                        f"Missing permissions for chain {chain_id}",
-                        details={"chain_id": chain_id}
-                    )
+        try:
+            await self.validate_chain_credentials(chain_id, config)
+            self._chain_configs[chain_id] = config
+        except Exception as e:
+            raise ConfigurationError(
+                f"Failed to configure chain {chain_id}",
+                details={
+                    "chain_id": chain_id,
+                    "error": str(e)
+                }
+            )
 
-                # Configure protocol adapter if specified
-                if 'protocol' in chain_config:
-                    protocol = chain_config['protocol']
-                    if protocol not in self._protocol_adapters:
-                        raise SecurityError(
-                            f"Unsupported protocol {protocol} for chain {chain_id}",
-                            details={"chain_id": chain_id, "protocol": protocol}
-                        )
+    async def get_chain_health(self, chain_id: str) -> Dict[str, Any]:
+        """Get health metrics for a chain.
+
+        Args:
+            chain_id: Chain identifier
+
+        Returns:
+            Dict containing health metrics
+
+        Raises:
+            ChainConnectionError: If chain not found
+        """
+        if chain_id not in self._connections:
+            raise ChainConnectionError(
+                f"Chain {chain_id} not connected",
+                details={"chain_id": chain_id}
+            )
+        return self._health_metrics.get(chain_id, {})
+
+    async def get_all_chain_health(self) -> Dict[str, Dict[str, Any]]:
+        """Get health metrics for all connected chains.
+
+        Returns:
+            Dict mapping chain IDs to their health metrics
+        """
+        return self._health_metrics.copy()
 
     async def connect_chain(
         self,
@@ -347,44 +372,165 @@ class ChainManager:
             ChainConnectionError: If chain not found
             TransactionError: If transaction fails
         """
-        try:
-            if chain_id not in self._connections:
-                raise ChainConnectionError(
-                    f"Chain {chain_id} not connected",
-                    details={"chain_id": chain_id}
-                )
-
-            web3 = self._connections[chain_id]
-            config = self._chain_configs[chain_id]
-
-            # Use protocol adapter if available
-            if 'protocol' in config:
-                adapter = self._protocol_adapters.get(config['protocol'])
-                if adapter:
-                    return await adapter.send_transaction(transaction)
-
-            # Fallback to direct Web3 transaction
-            tx_hash = await web3.eth.send_transaction(transaction)
-            return tx_hash.hex()
-
-        except Web3Exception as e:
-            raise TransactionError(
-                f"Transaction failed on chain {chain_id}",
-                details={
-                    "chain_id": chain_id,
-                    "transaction": transaction,
-                    "error": str(e)
-                }
+        if chain_id not in self._connections:
+            raise ChainConnectionError(
+                f"Chain {chain_id} not connected",
+                details={"chain_id": chain_id}
             )
+
+        web3 = self._connections[chain_id]
+        protocol_adapter = self._protocol_adapters.get(self._chain_configs[chain_id].get('protocol'))
+
+        try:
+            # Get chain-specific gas estimation and optimization
+            if protocol_adapter:
+                gas_estimate = await protocol_adapter.estimate_gas(web3, transaction)
+                optimized_tx = await protocol_adapter.optimize_transaction(web3, {
+                    **transaction,
+                    'gas': gas_estimate
+                })
+            else:
+                # Default gas estimation if no protocol adapter
+                gas_estimate = await web3.eth.estimate_gas(transaction)
+                optimized_tx = {
+                    **transaction,
+                    'gas': gas_estimate
+                }
+
+            # Add current gas price with buffer for network congestion
+            gas_price = await web3.eth.gas_price
+            optimized_tx['gasPrice'] = int(gas_price * 1.1)  # 10% buffer
+
+            # Execute transaction with exponential backoff retry
+            max_retries = 3
+            retry_delay = 1
+            for attempt in range(max_retries):
+                try:
+                    tx_hash = await web3.eth.send_transaction(optimized_tx)
+                    return tx_hash.hex()
+                except Exception as e:
+                    if attempt == max_retries - 1:
+                        raise
+                    await asyncio.sleep(retry_delay)
+                    retry_delay *= 2
+
         except Exception as e:
             raise TransactionError(
-                f"Unexpected error during transaction on chain {chain_id}",
+                "Transaction execution failed",
                 details={
                     "chain_id": chain_id,
-                    "transaction": transaction,
-                    "error": str(e)
+                    "error": str(e),
+                    "transaction": transaction
                 }
             )
+
+    async def execute_transaction_batch(
+        self,
+        chain_id: str,
+        transactions: List[Dict[str, Any]],
+        max_concurrent: int = 5
+    ) -> List[str]:
+        """Execute multiple transactions in parallel with rate limiting.
+
+        Args:
+            chain_id: Chain to execute transactions on
+            transactions: List of transaction parameters
+            max_concurrent: Maximum number of concurrent transactions
+
+        Returns:
+            List of transaction hashes
+
+        Raises:
+            ChainConnectionError: If chain not found
+            TransactionError: If any transaction fails
+        """
+        if not transactions:
+            return []
+
+        semaphore = asyncio.Semaphore(max_concurrent)
+        results = []
+
+        async def execute_with_semaphore(tx: Dict[str, Any]) -> str:
+            async with semaphore:
+                return await self.execute_transaction(chain_id, tx)
+
+        try:
+            # Execute transactions in parallel with rate limiting
+            tasks = [execute_with_semaphore(tx) for tx in transactions]
+            results = await asyncio.gather(*tasks)
+            return results
+        except Exception as e:
+            raise TransactionError(
+                "Batch transaction execution failed",
+                details={
+                    "chain_id": chain_id,
+                    "error": str(e),
+                    "completed_transactions": len(results)
+                }
+            )
+
+    async def track_transaction(
+        self,
+        chain_id: str,
+        tx_hash: str,
+        timeout: int = 300,
+        poll_interval: int = 2,
+        required_confirmations: int = 1
+    ) -> Dict[str, Any]:
+        """Track transaction status with timeout and confirmation requirements.
+
+        Args:
+            chain_id: Chain identifier
+            tx_hash: Transaction hash to track
+            timeout: Maximum time to wait in seconds
+            poll_interval: Time between status checks in seconds
+            required_confirmations: Number of required confirmations
+
+        Returns:
+            Transaction receipt with additional status information
+
+        Raises:
+            ChainConnectionError: If chain not found
+            TransactionError: If transaction fails or times out
+        """
+        if chain_id not in self._connections:
+            raise ChainConnectionError(
+                f"Chain {chain_id} not connected",
+                details={"chain_id": chain_id}
+            )
+
+        web3 = self._connections[chain_id]
+        start_time = asyncio.get_event_loop().time()
+
+        while True:
+            if asyncio.get_event_loop().time() - start_time > timeout:
+                raise TransactionError(
+                    f"Transaction {tx_hash} tracking timed out",
+                    details={
+                        "chain_id": chain_id,
+                        "tx_hash": tx_hash,
+                        "timeout": timeout
+                    }
+                )
+
+            try:
+                receipt = await web3.eth.get_transaction_receipt(tx_hash)
+                if receipt:
+                    current_block = await web3.eth.block_number
+                    confirmations = current_block - receipt['blockNumber']
+
+                    if confirmations >= required_confirmations:
+                        return {
+                            **dict(receipt),
+                            'confirmations': confirmations,
+                            'confirmed': True,
+                            'success': receipt['status'] == 1
+                        }
+
+            except Exception as e:
+                print(f"Error checking transaction {tx_hash}: {str(e)}")
+
+            await asyncio.sleep(poll_interval)
 
     async def _monitor_chain_status(self, chain_id: str) -> None:
         """Monitor chain status and manage connection pool.
@@ -402,6 +548,33 @@ class ChainManager:
 
                     web3 = self._connections[chain_id]
                     try:
+                        # Collect health metrics
+                        start_time = asyncio.get_event_loop().time()
+                        block_number = await web3.eth.block_number
+                        latency = asyncio.get_event_loop().time() - start_time
+
+                        # Get peer count if supported
+                        try:
+                            peer_count = await web3.net.peer_count
+                        except Exception:
+                            peer_count = None
+
+                        # Update health metrics
+                        self._health_metrics[chain_id] = {
+                            'latency': latency,
+                            'block_height': block_number,
+                            'peers': peer_count,
+                            'timestamp': asyncio.get_event_loop().time(),
+                            'connection_count': len(self._connection_pool.get(chain_id, [])),
+                            'is_syncing': await web3.eth.syncing
+                        }
+
+                        # Log warnings for concerning metrics
+                        if latency > 5.0:  # High latency threshold
+                            print(f"Warning: High latency ({latency:.2f}s) for chain {chain_id}")
+                        if peer_count is not None and peer_count < 3:  # Low peer count threshold
+                            print(f"Warning: Low peer count ({peer_count}) for chain {chain_id}")
+
                         # Test connection
                         await asyncio.wait_for(web3.eth.chain_id, timeout=5.0)
                     except (Web3Exception, asyncio.TimeoutError):
@@ -414,21 +587,31 @@ class ChainManager:
                             # Try to switch to another connection from pool
                             if pool:
                                 self._connections[chain_id] = pool[0]
+                                # Update health metrics for connection failure
+                                self._health_metrics[chain_id] = {
+                                    'error': 'Connection failed - switched to backup',
+                                    'timestamp': asyncio.get_event_loop().time(),
+                                    'connection_count': len(pool)
+                                }
                             else:
                                 # No more connections available
                                 del self._connections[chain_id]
                                 del self._chain_configs[chain_id]
                                 if chain_id in self._connection_pool:
                                     del self._connection_pool[chain_id]
+                                if chain_id in self._health_metrics:
+                                    del self._health_metrics[chain_id]
                                 break
 
             except Exception as e:
                 # Log error but continue monitoring
                 print(f"Error monitoring chain {chain_id}: {str(e)}")
+                if chain_id in self._health_metrics:
+                    self._health_metrics[chain_id]['error'] = str(e)
                 continue
 
     async def _get_connection(self, chain_id: str) -> AsyncWeb3:
-        """Get an available connection from the pool.
+        """Get an available connection from the pool with load balancing.
 
         Args:
             chain_id: Chain identifier
@@ -445,4 +628,21 @@ class ChainManager:
                     f"No connections available for chain {chain_id}",
                     details={"chain_id": chain_id}
                 )
-            return self._connection_pool[chain_id][0]  # Use first available connection
+
+            connections = self._connection_pool[chain_id]
+            # Rotate connections for load balancing
+            connection = connections.pop(0)
+            connections.append(connection)
+
+            # Verify connection health before returning
+            try:
+                await asyncio.wait_for(connection.eth.chain_id, timeout=2.0)
+                return connection
+            except (asyncio.TimeoutError, Exception) as e:
+                # Remove unhealthy connection
+                if connection in connections:
+                    connections.remove(connection)
+                raise ChainConnectionError(
+                    f"Connection health check failed for chain {chain_id}",
+                    details={"chain_id": chain_id, "error": str(e)}
+                )
