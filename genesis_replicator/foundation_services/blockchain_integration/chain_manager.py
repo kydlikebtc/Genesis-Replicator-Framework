@@ -41,15 +41,17 @@ class ChainManager:
         if self._initialized:
             return
 
-        async with self._lock:
-            self._initialized = True
-            self._connections.clear()
-            self._chain_configs.clear()
-            self._status_monitors.clear()
-            self._protocol_adapters.clear()
-
-            # Register default protocol adapters
-            await self.register_protocol_adapter("bnb", BNBChainAdapter())
+        try:
+            async with self._lock:
+                self._initialized = True
+                self._connections.clear()
+                self._chain_configs.clear()
+                self._status_monitors.clear()
+                self._protocol_adapters.clear()
+                # Note: Protocol adapters will be registered when needed
+        except Exception as e:
+            self._initialized = False
+            raise ConfigurationError("Failed to start chain manager", details={"error": str(e)})
 
     async def stop(self) -> None:
         """Stop and cleanup the chain manager."""
@@ -76,26 +78,24 @@ class ChainManager:
         async with self._lock:
             self._protocol_adapters[chain_type] = adapter
 
-    async def configure(self, chain_id: str, config: Dict[str, Any]) -> None:
+    async def configure(self, config: Dict[str, Dict[str, Any]]) -> None:
         """Configure chain connection parameters.
 
         Args:
-            chain_id: Chain identifier
-            config: Configuration parameters
+            config: Dictionary mapping chain IDs to their configuration parameters
 
         Raises:
             ConfigurationError: If configuration is invalid
         """
         try:
-            await self.validate_chain_credentials(chain_id, config)
-            self._chain_configs[chain_id] = config
+            async with self._lock:
+                for chain_id, chain_config in config.items():
+                    await self.validate_chain_credentials(chain_id, chain_config)
+                    self._chain_configs[chain_id] = chain_config
         except Exception as e:
             raise ConfigurationError(
-                f"Failed to configure chain {chain_id}",
-                details={
-                    "chain_id": chain_id,
-                    "error": str(e)
-                }
+                "Failed to configure chains",
+                details={"error": str(e)}
             )
 
     async def get_chain_health(self, chain_id: str) -> Dict[str, Any]:
@@ -125,25 +125,25 @@ class ChainManager:
         """
         return self._health_metrics.copy()
 
-    async def connect_chain(
-        self,
-        chain_id: str,
-        credentials: Optional[Dict[str, Any]] = None
-    ) -> None:
-        """Connect to a chain with security validation.
+    async def connect_chain(self, chain_id: str) -> bool:
+        """Connect to a chain.
 
         Args:
             chain_id: Chain identifier
-            credentials: Optional security credentials
+
+        Returns:
+            bool: True if connection successful
 
         Raises:
             SecurityError: If authentication fails
+            ChainConnectionError: If connection fails
         """
-        if not self._verify_chain_access(chain_id, credentials):
-            raise SecurityError(
-                "Unauthorized chain access",
-                details={"chain_id": chain_id}
-            )
+        if chain_id not in self._chain_configs:
+            raise ValueError(f"Chain {chain_id} not configured")
+
+        config = self._chain_configs[chain_id]
+        await self.connect_to_chain(chain_id, config["rpc_url"], **config)
+        return True
 
     async def validate_chain_credentials(
         self,
@@ -646,3 +646,11 @@ class ChainManager:
                     f"Connection health check failed for chain {chain_id}",
                     details={"chain_id": chain_id, "error": str(e)}
                 )
+
+    def get_supported_chains(self) -> List[str]:
+        """Get list of supported chain IDs.
+
+        Returns:
+            List of configured chain identifiers
+        """
+        return list(self._chain_configs.keys())
