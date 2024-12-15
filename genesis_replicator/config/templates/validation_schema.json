@@ -1,0 +1,138 @@
+{
+    "blockchain": {
+        "type": "object",
+        "required": ["chain_id", "rpc_url"],
+        "properties": {
+            "chain_id": {
+                "type": "integer",
+                "description": "Chain identifier"
+            },
+            "rpc_url": {
+                "type": "string",
+                "format": "uri",
+                "description": "RPC endpoint URL"
+            },
+            "ws_url": {
+                "type": "string",
+                "format": "uri",
+                "description": "WebSocket endpoint URL"
+            },
+            "explorer_url": {
+                "type": "string",
+                "format": "uri",
+                "description": "Block explorer URL"
+            },
+            "gas_limit": {
+                "type": "integer",
+                "minimum": 21000,
+                "description": "Maximum gas limit"
+            },
+            "gas_price_strategy": {
+                "type": "string",
+                "enum": ["low", "medium", "high", "custom"],
+                "description": "Gas price strategy"
+            },
+            "confirmation_blocks": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Required confirmation blocks"
+            },
+            "retry_count": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Maximum retry attempts"
+            },
+            "timeout": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Request timeout in seconds"
+            },
+            "rate_limits": {
+                "type": "object",
+                "properties": {
+                    "requests_per_second": {
+                        "type": "integer",
+                        "minimum": 1
+                    },
+                    "requests_per_minute": {
+                        "type": "integer",
+                        "minimum": 1
+                    }
+                }
+            }
+        }
+    },
+    "ai_model": {
+        "type": "object",
+        "required": ["provider", "model"],
+        "properties": {
+            "provider": {
+                "type": "string",
+                "enum": ["openai", "anthropic", "meta", "mistral", "google"],
+                "description": "AI model provider"
+            },
+            "model": {
+                "type": "string",
+                "description": "Model identifier"
+            },
+            "max_tokens": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Maximum tokens per request"
+            },
+            "temperature": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1,
+                "description": "Sampling temperature"
+            },
+            "top_p": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1,
+                "description": "Nucleus sampling parameter"
+            },
+            "rate_limits": {
+                "type": "object",
+                "properties": {
+                    "requests_per_minute": {
+                        "type": "integer",
+                        "minimum": 1
+                    },
+                    "tokens_per_minute": {
+                        "type": "integer",
+                        "minimum": 1
+                    }
+                }
+            },
+            "retry_config": {
+                "type": "object",
+                "properties": {
+                    "max_retries": {
+                        "type": "integer",
+                        "minimum": 0
+                    },
+                    "initial_delay": {
+                        "type": "number",
+                        "minimum": 0
+                    },
+                    "max_delay": {
+                        "type": "number",
+                        "minimum": 0
+                    },
+                    "backoff_factor": {
+                        "type": "number",
+                        "minimum": 1
+                    }
+                }
+            },
+            "fallback_models": {
+                "type": "array",
+                "items": {
+                    "type": "string"
+                },
+                "description": "Fallback model list"
+            }
+        }
+    }
+}

@@ -1,0 +1,36 @@
+{
+    "bnb_chain": {
+        "chain_id": 56,
+        "rpc_url": "https://bsc-dataseed.binance.org",
+        "ws_url": "wss://bsc-ws-node.nariox.org:443",
+        "explorer_url": "https://bscscan.com",
+        "gas_limit": 5000000,
+        "gas_price_strategy": "medium",
+        "confirmation_blocks": 12,
+        "retry_count": 3,
+        "timeout": 30,
+        "rate_limits": {
+            "requests_per_second": 10,
+            "requests_per_minute": 500
+        },
+        "contract_defaults": {
+            "max_fee_per_gas": "50000000000",
+            "priority_fee": "1500000000"
+        }
+    },
+    "ethereum": {
+        "chain_id": 1,
+        "rpc_url": "https://mainnet.infura.io/v3/${INFURA_KEY}",
+        "ws_url": "wss://mainnet.infura.io/ws/v3/${INFURA_KEY}",
+        "explorer_url": "https://etherscan.io",
+        "gas_limit": 2000000,
+        "gas_price_strategy": "medium",
+        "confirmation_blocks": 12,
+        "retry_count": 3,
+        "timeout": 30,
+        "rate_limits": {
+            "requests_per_second": 10,
+            "requests_per_minute": 500
+        }
+    }
+}

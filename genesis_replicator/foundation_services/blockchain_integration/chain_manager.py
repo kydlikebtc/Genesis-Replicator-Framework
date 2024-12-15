@@ -4,7 +4,7 @@ Chain Manager for blockchain integration.
 This module manages multi-chain operations, network connections, and chain status monitoring.
 """
 import asyncio
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Type
 from web3 import AsyncWeb3
 from web3.exceptions import Web3Exception
 
@@ -13,6 +13,8 @@ from ...foundation_services.exceptions import (
     TransactionError,
     SecurityError
 )
+from .protocols.base import BaseProtocolAdapter
+from .protocols.bnb_chain import BNBChainAdapter
 
 
 class ChainManager:
@@ -26,6 +28,7 @@ class ChainManager:
         self._lock = asyncio.Lock()
         self._connection_semaphore = asyncio.Semaphore(10)  # Limit concurrent connections
         self._connection_pool: Dict[str, List[AsyncWeb3]] = {}
+        self._protocol_adapters: Dict[str, BaseProtocolAdapter] = {}
         self._initialized = False
 
     async def start(self) -> None:
@@ -41,6 +44,10 @@ class ChainManager:
             self._connections.clear()
             self._chain_configs.clear()
             self._status_monitors.clear()
+            self._protocol_adapters.clear()
+
+            # Register default protocol adapters
+            await self.register_protocol_adapter("bnb", BNBChainAdapter())
 
     async def stop(self) -> None:
         """Stop and cleanup the chain manager."""
@@ -49,6 +56,23 @@ class ChainManager:
             for chain_id in list(self._connections.keys()):
                 await self.disconnect_from_chain(chain_id)
             self._initialized = False
+            self._protocol_adapters.clear()
+
+    async def register_protocol_adapter(self, chain_type: str, adapter: BaseProtocolAdapter) -> None:
+        """Register a protocol adapter for a specific chain type.
+
+        Args:
+            chain_type: Chain type identifier (e.g., "bnb", "eth")
+            adapter: Protocol adapter instance
+
+        Raises:
+            ValueError: If adapter is invalid
+        """
+        if not isinstance(adapter, BaseProtocolAdapter):
+            raise ValueError("Invalid protocol adapter")
+
+        async with self._lock:
+            self._protocol_adapters[chain_type] = adapter
 
     async def configure(self, config: Dict[str, Dict[str, Any]]) -> None:
         """Configure chain manager with security settings.
@@ -66,6 +90,15 @@ class ChainManager:
                         f"Missing permissions for chain {chain_id}",
                         details={"chain_id": chain_id}
                     )
+
+                # Configure protocol adapter if specified
+                if 'protocol' in chain_config:
+                    protocol = chain_config['protocol']
+                    if protocol not in self._protocol_adapters:
+                        raise SecurityError(
+                            f"Unsupported protocol {protocol} for chain {chain_id}",
+                            details={"chain_id": chain_id, "protocol": protocol}
+                        )
 
     async def connect_chain(
         self,
@@ -156,11 +189,25 @@ class ChainManager:
                             details={"chain_id": chain_id}
                         )
 
-                    # Initialize connection pool for this chain
+                    # Get protocol adapter if specified
+                    protocol = config.get('protocol')
+                    adapter = None
+                    if protocol:
+                        adapter = self._protocol_adapters.get(protocol)
+                        if not adapter:
+                            raise ChainConnectionError(
+                                f"Unsupported protocol {protocol}",
+                                details={"chain_id": chain_id, "protocol": protocol}
+                            )
+                        await adapter.configure_web3(endpoint_url)
+                        web3 = adapter.web3
+                    else:
+                        # Fallback to direct Web3 connection
+                        web3 = AsyncWeb3(AsyncWeb3.AsyncHTTPProvider(endpoint_url))
+
+                    # Initialize connection pool
                     if chain_id not in self._connection_pool:
                         self._connection_pool[chain_id] = []
-
-                    web3 = AsyncWeb3(AsyncWeb3.AsyncHTTPProvider(endpoint_url))
 
                     # Test connection
                     try:
@@ -308,8 +355,18 @@ class ChainManager:
                 )
 
             web3 = self._connections[chain_id]
+            config = self._chain_configs[chain_id]
+
+            # Use protocol adapter if available
+            if 'protocol' in config:
+                adapter = self._protocol_adapters.get(config['protocol'])
+                if adapter:
+                    return await adapter.send_transaction(transaction)
+
+            # Fallback to direct Web3 transaction
             tx_hash = await web3.eth.send_transaction(transaction)
             return tx_hash.hex()
+
         except Web3Exception as e:
             raise TransactionError(
                 f"Transaction failed on chain {chain_id}",
