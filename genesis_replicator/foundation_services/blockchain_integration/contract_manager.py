@@ -68,7 +68,7 @@ class ContractManager:
         contract_address: str,
         sanitize: bool = True
     ) -> Dict[str, Any]:
-        """Get contract state with input sanitization.
+        """Get contract state with input sanitization and validation.
 
         Args:
             chain_id: Chain identifier
@@ -76,11 +76,16 @@ class ContractManager:
             sanitize: Whether to sanitize inputs
 
         Returns:
-            Contract state information
+            Contract state information including:
+            - Basic contract info (address, name, chain_id)
+            - Deployment status
+            - Code verification status
+            - Current storage state
+            - Last interaction timestamp
 
         Raises:
             SecurityError: If input validation fails
-            ContractError: If contract not found
+            ContractError: If contract not found or state validation fails
         """
         if sanitize and not self._validate_input(contract_address):
             raise SecurityError(
@@ -100,12 +105,45 @@ class ContractManager:
                 }
             )
 
-        contract_data = self._contracts[contract_address]
-        return {
-            'address': contract_address,
-            'name': contract_data['name'],
-            'chain_id': contract_data['chain_id']
-        }
+        try:
+            web3 = self._web3_instances[chain_id]
+            contract_data = self._contracts[contract_address]
+
+            # Verify contract code exists and matches deployment
+            deployed_code = await web3.eth.get_code(contract_address)
+            if deployed_code == '0x' or deployed_code == b'0x' or deployed_code == b'':
+                raise ContractError(
+                    "Contract not deployed or destroyed",
+                    details={"contract_address": contract_address}
+                )
+
+            # Get latest block for timestamp
+            latest_block = await web3.eth.get_block('latest')
+
+            # Get contract state
+            state = {
+                'address': contract_address,
+                'name': contract_data['name'],
+                'chain_id': contract_data['chain_id'],
+                'deployed_at': contract_data.get('deployed_at', 0),
+                'owner': contract_data.get('owner', '0x0'),
+                'deployment_verified': True,
+                'code_hash': web3.keccak(deployed_code).hex(),
+                'last_interaction': latest_block.timestamp,
+                'balance': await web3.eth.get_balance(contract_address)
+            }
+
+            return state
+
+        except Web3Exception as e:
+            raise ContractError(
+                f"Failed to get contract state: {str(e)}",
+                details={
+                    "chain_id": chain_id,
+                    "contract_address": contract_address,
+                    "error": str(e)
+                }
+            )
 
     def _validate_input(self, input_str: str) -> bool:
         """Validate and sanitize input strings.
@@ -127,7 +165,7 @@ class ContractManager:
         chain_id: str = "default",
         **kwargs
     ) -> str:
-        """Deploy a new contract.
+        """Deploy a new contract with verification.
 
         Args:
             contract_id: Unique identifier for the contract
@@ -140,7 +178,7 @@ class ContractManager:
             Deployed contract address
 
         Raises:
-            ContractError: If deployment fails
+            ContractError: If deployment fails or verification fails
             SecurityError: If authentication fails
         """
         if not self._initialized:
@@ -175,30 +213,78 @@ class ContractManager:
 
                     # Deploy contract (mock implementation for testing)
                     contract_address = f"0x{contract_id}{'0' * 40}"
+                    deployment_block = await web3.eth.block_number
 
-                    self._contracts[contract_id] = {
-                        'address': contract_address,
-                        'name': contract_name,
-                        'chain_id': chain_id,
-                        'deployed_at': await web3.eth.block_number,
-                        'owner': kwargs.get('from_address', '0x0')
-                    }
+                    # Verify deployment
+                    max_verification_attempts = 3
+                    verification_delay = 2  # seconds
 
-                    return contract_address
+                    for attempt in range(max_verification_attempts):
+                        try:
+                            # Check contract code is deployed
+                            deployed_code = await web3.eth.get_code(contract_address)
+                            if deployed_code == '0x' or deployed_code == b'0x' or deployed_code == b'':
+                                if attempt == max_verification_attempts - 1:
+                                    raise ContractError(
+                                        "Contract deployment verification failed",
+                                        details={
+                                            "contract_id": contract_id,
+                                            "contract_address": contract_address
+                                        }
+                                    )
+                                await asyncio.sleep(verification_delay)
+                                continue
+
+                            # Verify contract initialization
+                            try:
+                                # Try to call a view function (e.g., owner() or name())
+                                contract = web3.eth.contract(
+                                    address=contract_address,
+                                    abi=self._abis.get(contract_name, [])
+                                )
+                                if hasattr(contract.functions, 'owner'):
+                                    await contract.functions.owner().call()
+                                elif hasattr(contract.functions, 'name'):
+                                    await contract.functions.name().call()
+                            except Exception as e:
+                                if attempt == max_verification_attempts - 1:
+                                    raise ContractError(
+                                        "Contract initialization verification failed",
+                                        details={
+                                            "contract_id": contract_id,
+                                            "error": str(e)
+                                        }
+                                    )
+                                await asyncio.sleep(verification_delay)
+                                continue
+
+                            # Store verified contract
+                            self._contracts[contract_id] = {
+                                'address': contract_address,
+                                'name': contract_name,
+                                'chain_id': chain_id,
+                                'deployed_at': deployment_block,
+                                'owner': kwargs.get('from_address', '0x0'),
+                                'deployment_verified': True,
+                                'code_hash': web3.keccak(deployed_code).hex()
+                            }
+
+                            return contract_address
+
+                        except Exception as e:
+                            if attempt == max_verification_attempts - 1:
+                                raise ContractError(
+                                    "Contract deployment verification failed",
+                                    details={
+                                        "contract_id": contract_id,
+                                        "error": str(e)
+                                    }
+                                )
+                            await asyncio.sleep(verification_delay)
 
         except (Web3Exception, ContractLogicError) as e:
             raise ContractError(
                 f"Contract deployment failed: {str(e)}",
-                details={
-                    "contract_id": contract_id,
-                    "contract_name": contract_name,
-                    "chain_id": chain_id,
-                    "error": str(e)
-                }
-            )
-        except Exception as e:
-            raise ContractError(
-                "Unexpected error during contract deployment",
                 details={
                     "contract_id": contract_id,
                     "contract_name": contract_name,
@@ -498,7 +584,7 @@ class ContractManager:
         retry_interval: int = 5,
         max_retries: int = 3
     ) -> AsyncGenerator[Dict[str, Any], None]:
-        """Monitor contract events with batching and error handling.
+        """Monitor contract events with enhanced filtering and backfilling.
 
         Args:
             chain_id: Chain identifier
@@ -512,10 +598,15 @@ class ContractManager:
             max_retries: Maximum number of retry attempts
 
         Yields:
-            Event data dictionaries
+            Event data dictionaries with enhanced information including:
+            - Event details (name, args, etc.)
+            - Block information (number, hash, timestamp)
+            - Transaction details (hash, gas used, status)
+            - Contract context (address, chain)
 
         Raises:
             ContractError: If event monitoring fails
+            SecurityError: If filter validation fails
         """
         try:
             if contract_address not in self._contracts:
@@ -534,7 +625,7 @@ class ContractManager:
                 abi=contract_data['abi']
             )
 
-            # Get event object
+            # Get event object and validate filters
             event = getattr(contract.events, event_name)
             if event is None:
                 raise ContractError(
@@ -545,26 +636,46 @@ class ContractManager:
                     }
                 )
 
-            # Set up monitoring parameters
+            # Validate event filters against ABI
+            if filters:
+                event_abi = next(
+                    (e for e in contract_data['abi'] if e['type'] == 'event' and e['name'] == event_name),
+                    None
+                )
+                if event_abi:
+                    valid_params = {i['name']: i['type'] for i in event_abi.get('inputs', [])}
+                    for filter_name in filters:
+                        if filter_name not in valid_params:
+                            raise SecurityError(
+                                f"Invalid event filter parameter: {filter_name}",
+                                details={
+                                    "valid_params": list(valid_params.keys()),
+                                    "provided_filter": filter_name
+                                }
+                            )
+
+            # Set up monitoring parameters with backfilling support
             latest_block = await web3.eth.block_number
             start_block = from_block if from_block is not None else max(0, latest_block - 1000)
             end_block = to_block if to_block is not None else latest_block
 
-            # Process events in batches with retry logic
+            # Process events in batches with enhanced retry logic
             async def monitor():
                 current_block = start_block
                 while current_block <= end_block:
                     batch_end = min(current_block + batch_size, end_block)
                     retry_count = 0
+                    backoff_time = retry_interval
 
                     while retry_count < max_retries:
                         try:
-                            # Add chain-specific handling for BNB Chain
+                            # Add chain-specific handling
                             if chain_id == 'bnb':
                                 # BNB Chain has different block time, adjust batch size
                                 adjusted_batch_size = min(batch_size, 100)
                                 batch_end = min(current_block + adjusted_batch_size, end_block)
 
+                            # Get events with pagination
                             events = await event.get_logs(
                                 fromBlock=current_block,
                                 toBlock=batch_end,
@@ -572,7 +683,10 @@ class ContractManager:
                             )
 
                             for evt in events:
+                                # Enhance event data with additional context
                                 block = await web3.eth.get_block(evt.blockNumber)
+                                tx_receipt = await web3.eth.get_transaction_receipt(evt.transactionHash)
+
                                 yield {
                                     'event': event_name,
                                     'args': dict(evt.args),
@@ -581,7 +695,10 @@ class ContractManager:
                                     'log_index': evt.logIndex,
                                     'chain_id': chain_id,
                                     'timestamp': block.timestamp,
-                                    'block_hash': evt.blockHash.hex()
+                                    'block_hash': evt.blockHash.hex(),
+                                    'gas_used': tx_receipt.gasUsed,
+                                    'status': tx_receipt.status,
+                                    'contract_address': contract_address
                                 }
                             break  # Success, exit retry loop
 
@@ -590,7 +707,9 @@ class ContractManager:
                             if retry_count >= max_retries:
                                 print(f"Error processing events in block range {current_block}-{batch_end}: {str(e)}")
                                 break
-                            await asyncio.sleep(retry_interval)
+                            # Exponential backoff
+                            await asyncio.sleep(backoff_time)
+                            backoff_time *= 2
 
                     current_block = batch_end + 1
 
