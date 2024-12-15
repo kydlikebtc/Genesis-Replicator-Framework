@@ -4,13 +4,18 @@ Model Registry Module
 This module manages AI model registration, versioning, and lifecycle management
 in the Genesis Replicator Framework.
 """
-from typing import Dict, Any, Optional, List, Union
+from typing import Dict, Any, Optional, List, Union, Type
 import logging
 from dataclasses import dataclass
 from datetime import datetime
 import json
 from enum import Enum
 import hashlib
+import asyncio
+
+from .providers.base import ModelProviderInterface
+from .rate_limiter import RateLimiter
+from .fallback_manager import FallbackManager
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -45,6 +50,7 @@ class ModelInfo:
     versions: Dict[str, ModelVersion]
     current_version: Optional[str]
     tags: List[str]
+    provider_config: Optional[Dict[str, Any]] = None
 
 class ModelRegistry:
     """Manages AI model registration, versioning, and lifecycle."""
@@ -52,7 +58,43 @@ class ModelRegistry:
     def __init__(self):
         """Initialize the ModelRegistry."""
         self.models: Dict[str, ModelInfo] = {}
-        logger.info("Model Registry initialized")
+        self._providers: Dict[str, ModelProviderInterface] = {}
+        self._rate_limiter = RateLimiter()
+        self._fallback_manager = FallbackManager()
+        self._lock = asyncio.Lock()
+        self._initialized = False
+        logger.info("Model Registry initialized with provider support")
+
+    async def initialize_provider(
+        self,
+        provider_name: str,
+        provider_class: Type[ModelProviderInterface],
+        config: Dict[str, Any]
+    ) -> None:
+        """Initialize a model provider.
+
+        Args:
+            provider_name: Provider identifier
+            provider_class: Provider class
+            config: Provider configuration
+
+        Raises:
+            ValueError: If provider configuration is invalid
+            RuntimeError: If initialization fails
+        """
+        try:
+            provider = provider_class()
+            await provider.initialize(config)
+            self._providers[provider_name] = provider
+            self._fallback_manager.register_provider(
+                config.get('model', provider_name),
+                provider,
+                priority=config.get('priority', 0)
+            )
+            logger.info(f"Initialized provider: {provider_name}")
+        except Exception as e:
+            logger.error(f"Failed to initialize provider {provider_name}: {str(e)}")
+            raise RuntimeError(f"Provider initialization failed: {str(e)}")
 
     def register_model(
         self,
@@ -61,7 +103,8 @@ class ModelRegistry:
         description: str = "",
         metadata: Dict[str, Any] = None,
         tags: List[str] = None,
-        version: str = "1.0.0"
+        version: str = "1.0.0",
+        provider_config: Optional[Dict[str, Any]] = None
     ) -> str:
         """
         Register a new model or new version of existing model.
@@ -73,6 +116,7 @@ class ModelRegistry:
             metadata: Additional model metadata
             tags: List of tags for the model
             version: Version string for this model instance
+            provider_config: Configuration for the model provider
 
         Returns:
             Version ID of the registered model
@@ -110,12 +154,73 @@ class ModelRegistry:
                 updated_at=datetime.now(),
                 versions={version_id: model_version},
                 current_version=version_id,
-                tags=tags
+                tags=tags,
+                provider_config=provider_config
             )
             self.models[name] = model_info
 
         logger.info(f"Registered model: {name} (version: {version_id})")
         return version_id
+
+    async def generate_text(
+        self,
+        model_name: str,
+        prompt: str,
+        version_id: Optional[str] = None,
+        max_tokens: Optional[int] = None,
+        temperature: float = 0.7,
+        **kwargs: Any
+    ) -> str:
+        """Generate text using a registered model.
+
+        Args:
+            model_name: Name of the model
+            prompt: Input prompt
+            version_id: Optional specific version to use
+            max_tokens: Maximum tokens to generate
+            temperature: Sampling temperature
+            **kwargs: Additional generation parameters
+
+        Returns:
+            Generated text
+
+        Raises:
+            ValueError: If model not found
+            RuntimeError: If generation fails
+        """
+        model_info = self.models.get(model_name)
+        if not model_info:
+            raise ValueError(f"Model '{model_name}' not found")
+
+        if not model_info.provider_config:
+            raise ValueError(f"No provider configuration for model '{model_name}'")
+
+        provider_name = model_info.provider_config.get('provider')
+        if not provider_name:
+            raise ValueError(f"No provider specified for model '{model_name}'")
+
+        try:
+            # Apply rate limiting
+            await self._rate_limiter.acquire(provider_name)
+
+            # Generate with fallback support
+            result, provider = await self._fallback_manager.execute_with_fallback(
+                model_name,
+                'generate',
+                prompt,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                **kwargs
+            )
+
+            # Validate response
+            if not await provider.validate_response(result):
+                raise RuntimeError("Generated response validation failed")
+
+            return result
+        except Exception as e:
+            logger.error(f"Text generation failed for model {model_name}: {str(e)}")
+            raise RuntimeError(f"Text generation failed: {str(e)}")
 
     def get_model(
         self,
@@ -265,3 +370,35 @@ class ModelRegistry:
             })
 
         return sorted(history, key=lambda x: x["created_at"])
+
+    async def get_provider_info(self, provider_name: str) -> Dict[str, Any]:
+        """Get information about a registered provider.
+
+        Args:
+            provider_name: Provider identifier
+
+        Returns:
+            Provider information dictionary
+
+        Raises:
+            ValueError: If provider not found
+        """
+        if provider_name not in self._providers:
+            raise ValueError(f"Provider {provider_name} not found")
+
+        try:
+            provider = self._providers[provider_name]
+            info = await provider.get_model_info()
+            info['remaining_calls'] = self._rate_limiter.get_remaining_calls(provider_name)
+            return info
+        except Exception as e:
+            logger.error(f"Failed to get provider info for {provider_name}: {str(e)}")
+            raise RuntimeError(f"Failed to get provider info: {str(e)}")
+
+    def get_registered_providers(self) -> List[str]:
+        """Get list of registered provider names.
+
+        Returns:
+            List of provider names
+        """
+        return list(self._providers.keys())
