@@ -10,6 +10,13 @@ import logging
 import asyncio
 from dataclasses import dataclass, field
 
+from ..exceptions import (
+    EventNotFoundError,
+    EventHandlerError,
+    EventRouterError,
+    EventValidationError
+)
+
 logger = logging.getLogger(__name__)
 
 @dataclass
@@ -56,7 +63,18 @@ class EventRouter:
             event_type: Type of event to subscribe to
             callback: Function to call when event occurs
             subscriber_id: Unique identifier for the subscriber
+
+        Raises:
+            EventValidationError: If event_type or subscriber_id is invalid
         """
+        if not event_type or not isinstance(event_type, str):
+            raise EventValidationError("Invalid event type",
+                                     details={"event_type": event_type})
+
+        if not subscriber_id or not isinstance(subscriber_id, str):
+            raise EventValidationError("Invalid subscriber ID",
+                                     details={"subscriber_id": subscriber_id})
+
         if event_type not in self._subscriptions:
             self._subscriptions[event_type] = set()
 
@@ -71,10 +89,12 @@ class EventRouter:
         Args:
             event_type: Type of event to unsubscribe from
             subscriber_id: Unique identifier for the subscriber
+
+        Raises:
+            EventNotFoundError: If event_type doesn't exist
         """
         if event_type not in self._subscriptions:
-            logger.warning(f"No subscriptions found for event type {event_type}")
-            return
+            raise EventNotFoundError(event_type)
 
         self._subscriptions[event_type] = {
             sub for sub in self._subscriptions[event_type]
@@ -89,20 +109,28 @@ class EventRouter:
         Args:
             event_type: Type of event to publish
             data: Data to send with the event
+
+        Raises:
+            EventRouterError: If router is not running
+            EventNotFoundError: If no subscribers exist for event_type
         """
         if not self._running:
-            logger.error("Cannot publish event: Event router is not running")
-            return
+            raise EventRouterError("Cannot publish event: Event router is not running")
 
         if event_type not in self._subscriptions:
-            logger.warning(f"No subscribers found for event type {event_type}")
-            return
+            raise EventNotFoundError(event_type)
 
         await self._event_queue.put((event_type, data))
         logger.debug(f"Published event {event_type}")
 
     async def process_events(self) -> None:
-        """Process events from the event queue."""
+        """
+        Process events from the event queue.
+
+        Raises:
+            EventHandlerError: If a subscriber callback fails
+            EventRouterError: If event processing fails
+        """
         while self._running:
             try:
                 event_type, data = await self._event_queue.get()
@@ -112,12 +140,26 @@ class EventRouter:
                     try:
                         await subscription.callback(data)
                     except Exception as e:
-                        logger.error(f"Error in subscriber callback: {e}")
+                        error_details = {
+                            "event_type": event_type,
+                            "subscriber_id": subscription.subscriber_id,
+                            "error": str(e)
+                        }
+                        logger.error(f"Error in subscriber callback: {error_details}")
+                        raise EventHandlerError(
+                            f"Subscriber callback failed: {str(e)}",
+                            details=error_details
+                        )
 
                 self._event_queue.task_done()
 
             except Exception as e:
-                logger.error(f"Error processing event: {e}")
+                error_details = {"error": str(e)}
+                logger.error(f"Error processing event: {error_details}")
+                raise EventRouterError(
+                    f"Event processing failed: {str(e)}",
+                    details=error_details
+                )
 
     def get_subscribers(self, event_type: Optional[str] = None) -> Dict[str, List[str]]:
         """
@@ -128,15 +170,19 @@ class EventRouter:
 
         Returns:
             Dictionary mapping event types to lists of subscriber IDs
+
+        Raises:
+            EventNotFoundError: If specified event_type doesn't exist
         """
         result = {}
 
         if event_type:
-            if event_type in self._subscriptions:
-                result[event_type] = [
-                    sub.subscriber_id
-                    for sub in self._subscriptions[event_type]
-                ]
+            if event_type not in self._subscriptions:
+                raise EventNotFoundError(event_type)
+            result[event_type] = [
+                sub.subscriber_id
+                for sub in self._subscriptions[event_type]
+            ]
         else:
             for evt_type, subscriptions in self._subscriptions.items():
                 result[evt_type] = [
