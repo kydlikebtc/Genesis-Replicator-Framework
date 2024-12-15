@@ -61,6 +61,7 @@ class AlertManager:
             severity: [] for severity in AlertSeverity
         }
         self._alert_counter = 0
+        self._running = False
 
     def register_handler(self, handler: AlertHandler, severity: AlertSeverity):
         """Register an alert handler for a specific severity level.
@@ -207,3 +208,15 @@ class AlertManager:
             alert for alert in self.alerts.values()
             if alert.status == status
         ]
+
+    async def start(self):
+        """Start the alert manager."""
+        if self._running:
+            return
+        self._running = True
+
+    async def stop(self):
+        """Stop the alert manager."""
+        if not self._running:
+            return
+        self._running = False

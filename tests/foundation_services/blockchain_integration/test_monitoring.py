@@ -3,7 +3,8 @@ Monitoring system validation tests for blockchain components.
 """
 import pytest
 import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
+import logging
+from unittest.mock import AsyncMock, patch
 from web3 import AsyncWeb3
 
 from genesis_replicator.foundation_services.blockchain_integration.chain_manager import ChainManager
@@ -12,21 +13,27 @@ from genesis_replicator.monitoring.metrics_collector import MetricsCollector
 from genesis_replicator.monitoring.health_checker import HealthChecker
 from genesis_replicator.monitoring.alert_manager import AlertManager
 
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
+
 @pytest.fixture(scope="function")
 def event_loop():
     """Create an instance of the default event loop for each test case."""
+    logger.debug("Setting up event loop")
     policy = asyncio.get_event_loop_policy()
     loop = policy.new_event_loop()
     asyncio.set_event_loop(loop)
     yield loop
+    logger.debug("Cleaning up event loop")
     loop.close()
     asyncio.set_event_loop(None)
 
 @pytest.fixture
-def web3_mock():
+async def web3_mock():
     """Create a mock Web3 instance."""
-    mock = MagicMock()
-    mock.eth = MagicMock()
+    mock = AsyncMock()
+    mock.__class__ = AsyncWeb3
+    mock.eth = AsyncMock()
     mock.eth.chain_id = AsyncMock(return_value=1)
     mock.eth.get_balance = AsyncMock(return_value=1000000)
     mock.eth.gas_price = AsyncMock(return_value=20000000000)
@@ -38,9 +45,15 @@ def web3_mock():
         'transactions': [{'hash': '0x456...'} for _ in range(10)]
     })
     mock.eth.send_transaction = AsyncMock(return_value=bytes.fromhex('1234'))
-    mock.eth.contract = MagicMock()
+    mock.eth.contract = AsyncMock()
     mock.is_connected = AsyncMock(return_value=True)
-    mock.is_address = MagicMock(return_value=True)
+    mock.is_address = AsyncMock(return_value=True)
+
+    # Mock provider
+    mock_provider = AsyncMock()
+    mock_provider.is_connected = AsyncMock(return_value=True)
+    mock.provider = mock_provider
+
     return mock
 
 @pytest.fixture
@@ -49,30 +62,46 @@ async def monitoring_system(event_loop):
     metrics = MetricsCollector()
     health = HealthChecker()
     alerts = AlertManager()
+    chain_manager = ChainManager()
+    contract_manager = ContractManager()
 
-    await metrics.start()
-    await health.start()
-    await alerts.start()
+    # Start components
+    async def start_components():
+        await metrics.start()
+        await health.start()
+        await alerts.start()
+        await chain_manager.start()
+        await contract_manager.start()
 
-    try:
-        yield {
-            'metrics': metrics,
-            'health': health,
-            'alerts': alerts
-        }
-    finally:
-        await metrics.stop()
-        await health.stop()
-        await alerts.stop()
+    event_loop.run_until_complete(start_components())
+
+    components = {
+        'metrics': metrics,
+        'health': health,
+        'alerts': alerts,
+        'chain_manager': chain_manager,
+        'contract_manager': contract_manager
+    }
+
+    def cleanup():
+        async def stop_components():
+            await metrics.stop()
+            await health.stop()
+            await alerts.stop()
+            await chain_manager.stop()
+            await contract_manager.stop()
+        event_loop.run_until_complete(stop_components())
+
+    return components
 
 @pytest.fixture
-async def blockchain_system(event_loop, web3_mock):
+def blockchain_system(event_loop, web3_mock):
     """Create blockchain system components."""
     chain_manager = ChainManager()
     contract_manager = ContractManager()
 
-    await chain_manager.start()
-    await contract_manager.start()
+    event_loop.run_until_complete(chain_manager.start())
+    event_loop.run_until_complete(contract_manager.start())
 
     # Configure chain
     config = {
@@ -83,17 +112,20 @@ async def blockchain_system(event_loop, web3_mock):
     }
 
     with patch.object(AsyncWeb3, '__new__', return_value=web3_mock):
-        await chain_manager.configure(config)
-        await chain_manager.connect_chain("test_chain")
-        try:
-            yield {
-                'chain': chain_manager,
-                'contract': contract_manager,
-                'web3': web3_mock
-            }
-        finally:
-            await contract_manager.stop()
-            await chain_manager.stop()
+        event_loop.run_until_complete(chain_manager.configure(config))
+        event_loop.run_until_complete(chain_manager.connect_chain("test_chain"))
+
+    components = {
+        'chain': chain_manager,
+        'contract': contract_manager,
+        'web3': web3_mock
+    }
+
+    def cleanup():
+        event_loop.run_until_complete(contract_manager.stop())
+        event_loop.run_until_complete(chain_manager.stop())
+
+    return components
 
 @pytest.mark.asyncio
 async def test_chain_metrics_collection(monitoring_system, blockchain_system):
@@ -135,7 +167,7 @@ async def test_contract_metrics_collection(monitoring_system, blockchain_system)
     mock_contract.functions.constructor().transact = AsyncMock(return_value=bytes.fromhex('123456'))
     web3_mock.eth.contract.return_value = mock_contract
 
-    with patch.object(AsyncWeb3, '__new__', return_value=web3_mock):
+    async with patch.object(AsyncWeb3, '__new__', return_value=web3_mock):
         await contract_manager.deploy_contract(
             "test_contract",
             contract_abi,

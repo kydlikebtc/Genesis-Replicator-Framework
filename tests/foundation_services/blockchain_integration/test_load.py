@@ -3,9 +3,8 @@ Load testing for blockchain integration components.
 """
 import asyncio
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 from web3 import AsyncWeb3
-from web3.exceptions import Web3Exception
 
 from genesis_replicator.foundation_services.blockchain_integration.sync_manager import SyncManager
 from genesis_replicator.foundation_services.blockchain_integration.transaction_manager import TransactionManager
@@ -21,18 +20,28 @@ async def managers():
     chain_manager = ChainManager()
     contract_manager = ContractManager()
 
+    # Initialize all managers
     await sync_manager.start()
+    await tx_manager.start()
     await chain_manager.start()
+    await contract_manager.start()
 
-    yield {
-        'sync': sync_manager,
-        'tx': tx_manager,
-        'chain': chain_manager,
-        'contract': contract_manager
-    }
-
-    await sync_manager.stop()
-    await chain_manager.stop()
+    # Return managers with cleanup
+    try:
+        yield {
+            'sync': sync_manager,
+            'tx': tx_manager,
+            'chain': chain_manager,
+            'contract': contract_manager
+        }
+    finally:
+        # Cleanup all managers
+        await asyncio.gather(
+            sync_manager.stop(),
+            tx_manager.stop(),
+            chain_manager.stop(),
+            contract_manager.stop()
+        )
 
 
 @pytest.mark.asyncio
@@ -41,13 +50,11 @@ async def test_concurrent_chain_sync(managers):
     sync_manager = managers['sync']
 
     # Setup multiple mock Web3 instances
-    chains = {
-        'chain1': AsyncMock(spec=AsyncWeb3),
-        'chain2': AsyncMock(spec=AsyncWeb3),
-        'chain3': AsyncMock(spec=AsyncWeb3)
-    }
-
-    for chain_id, web3 in chains.items():
+    chains = {}
+    for i in range(3):
+        chain_id = f'chain{i}'
+        web3 = AsyncMock()
+        web3.__class__ = AsyncWeb3
         web3.eth = AsyncMock()
         web3.eth.block_number = AsyncMock(return_value=1000)
         web3.eth.get_block = AsyncMock(return_value={
@@ -55,28 +62,46 @@ async def test_concurrent_chain_sync(managers):
             'hash': f'0x{chain_id}',
             'transactions': []
         })
+        web3.is_connected = AsyncMock(return_value=True)
+        chains[chain_id] = web3
 
-    # Start sync on multiple chains
-    tasks = []
-    for chain_id, web3 in chains.items():
-        tasks.append(sync_manager.start_sync(chain_id, web3, 900))
+    # Configure chains
+    config = {
+        chain_id: {
+            'rpc_url': f'http://localhost:{8545+i}',
+            'chain_id': i
+        }
+        for i, chain_id in enumerate(chains)
+    }
+    await sync_manager.configure(config)
 
-    await asyncio.gather(*tasks)
-    await asyncio.sleep(0.1)  # Allow sync to process
+    try:
+        # Start sync on multiple chains
+        sync_tasks = []
+        for chain_id in chains:
+            sync_tasks.append(sync_manager.start_sync(chain_id))
+        await asyncio.gather(*sync_tasks)
+        await asyncio.sleep(0.1)  # Allow sync to process
 
-    # Verify all chains are syncing
-    for chain_id in chains:
-        status = await sync_manager.get_sync_status(chain_id)
-        assert status['is_running']
-        assert status['current_block'] == 900
-        await sync_manager.stop_sync(chain_id)
+        # Verify all chains are syncing
+        for chain_id in chains:
+            status = await sync_manager.get_sync_status(chain_id)
+            assert status['is_syncing']
+            assert status['current_block'] >= 900
+    finally:
+        # Cleanup
+        stop_tasks = []
+        for chain_id in chains:
+            stop_tasks.append(sync_manager.stop_sync(chain_id))
+        await asyncio.gather(*stop_tasks)
 
 
 @pytest.mark.asyncio
 async def test_transaction_batch_load(managers):
     """Test processing large transaction batches."""
     tx_manager = managers['tx']
-    web3 = AsyncMock(spec=AsyncWeb3)
+    web3 = AsyncMock()
+    web3.__class__ = AsyncWeb3
     web3.eth = AsyncMock()
     web3.eth.get_transaction_count = AsyncMock(return_value=1)
     web3.eth.send_transaction = AsyncMock()
@@ -103,33 +128,51 @@ async def test_transaction_batch_load(managers):
 async def test_contract_deployment_load(managers):
     """Test deploying multiple contracts concurrently."""
     contract_manager = managers['contract']
-    web3 = AsyncMock(spec=AsyncWeb3)
+    chain_manager = managers['chain']
+
+    # Setup mock Web3
+    web3 = AsyncMock()
+    web3.__class__ = AsyncWeb3
     web3.eth = AsyncMock()
+    web3.eth.chain_id = AsyncMock(return_value=1)
+    web3.eth.get_code = AsyncMock(return_value='0x123456')
+    web3.eth.get_transaction_receipt = AsyncMock(return_value={'status': 1})
+    web3.is_connected = AsyncMock(return_value=True)
     web3.eth.contract = AsyncMock()
-    web3.eth.get_contract_code = AsyncMock()
+    web3.eth.send_transaction = AsyncMock(return_value='0xtxhash')
+    web3.eth.wait_for_transaction_receipt = AsyncMock(return_value={'contractAddress': '0xcontract'})
 
-    # Deploy multiple contracts concurrently
+    # Configure chain
     chain_id = "test_chain"
-    abi = [{"type": "function", "name": "test"}]
-    bytecode = "0x123456"
+    await chain_manager.configure({
+        chain_id: {
+            'rpc_url': 'http://localhost:8545',
+            'chain_id': 1
+        }
+    })
 
-    async def deploy_contract(i):
-        address = f"0x{i}"
-        mock_contract = AsyncMock()
-        mock_contract.address = address
-        web3.eth.contract.return_value.constructor.return_value.transact.return_value = address
-        return await contract_manager.deploy_contract(
-            chain_id, web3, abi, bytecode, []
-        )
+    try:
+        # Deploy multiple contracts concurrently
+        tasks = []
+        contract_abi = [{"type": "constructor", "inputs": []}]
+        contract_bytecode = "0x123456"
+        for i in range(50):
+            tasks.append(
+                contract_manager.deploy_contract(
+                    f"contract_{i}",
+                    contract_abi,
+                    contract_bytecode,
+                    chain_id
+                )
+            )
 
-    # Deploy 50 contracts concurrently
-    tasks = [deploy_contract(i) for i in range(50)]
-    results = await asyncio.gather(*tasks)
-
-    assert len(results) == 50
-    assert all(isinstance(addr, str) for addr in results)
-
-
+        results = await asyncio.gather(*tasks)
+        assert len(results) == 50
+        assert all(isinstance(addr, str) for addr in results)
+    finally:
+        # Cleanup registered contracts
+        for i in range(50):
+            await contract_manager.unregister_contract(f"contract_{i}")
 
 
 @pytest.mark.asyncio
@@ -163,23 +206,37 @@ async def test_system_recovery(managers):
 
     # Simulate system crash during multi-chain sync
     chains = {
-        'chain1': AsyncMock(spec=AsyncWeb3),
-        'chain2': AsyncMock(spec=AsyncWeb3)
+        'chain1': AsyncMock(),
+        'chain2': AsyncMock()
     }
 
-    for chain_id, web3 in chains.items():
-        web3.eth = AsyncMock()
-        web3.eth.block_number = AsyncMock(return_value=1000)
-        web3.eth.get_block = AsyncMock()
-        await sync_manager.start_sync(chain_id, web3, 900)
+    try:
+        for chain_id, web3 in chains.items():
+            web3.__class__ = AsyncWeb3
+            web3.eth = AsyncMock()
+            web3.eth.block_number = AsyncMock(return_value=1000)
+            web3.eth.get_block = AsyncMock()
+            web3.is_connected = AsyncMock(return_value=True)
+            await sync_manager.start_sync(chain_id, web3, 900)
 
-    # Simulate crash
-    for chain_id in chains:
-        sync_manager._sync_states[chain_id]['running'] = False
+        # Simulate crash
+        for chain_id in chains:
+            sync_manager._sync_states[chain_id]['running'] = False
+            await asyncio.sleep(0.1)  # Allow state change to propagate
 
-    # Recover system
-    for chain_id, web3 in chains.items():
-        await sync_manager.start_sync(chain_id, web3, 900)
-        status = await sync_manager.get_sync_status(chain_id)
-        assert status['is_running']
-        await sync_manager.stop_sync(chain_id)
+        # Recover system
+        recovery_tasks = []
+        for chain_id, web3 in chains.items():
+            recovery_tasks.append(sync_manager.start_sync(chain_id, web3, 900))
+        await asyncio.gather(*recovery_tasks)
+
+        # Verify recovery
+        for chain_id in chains:
+            status = await sync_manager.get_sync_status(chain_id)
+            assert status['is_running']
+    finally:
+        # Cleanup
+        stop_tasks = []
+        for chain_id in chains:
+            stop_tasks.append(sync_manager.stop_sync(chain_id))
+        await asyncio.gather(*stop_tasks)

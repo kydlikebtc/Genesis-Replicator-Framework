@@ -1,29 +1,46 @@
 """
-Tests for the blockchain sync manager.
+Tests for blockchain synchronization manager.
 """
 import asyncio
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 from web3 import AsyncWeb3
-from web3.exceptions import Web3Exception
 
-from genesis_replicator.foundation_services.exceptions import BlockchainError
 from genesis_replicator.foundation_services.blockchain_integration.sync_manager import SyncManager
+from genesis_replicator.foundation_services.blockchain_integration.exceptions import ChainConnectionError
 
-
-@pytest.fixture(scope="function")
+@pytest.fixture
 def event_loop():
     """Create an instance of the default event loop for each test case."""
     policy = asyncio.get_event_loop_policy()
     loop = policy.new_event_loop()
-    asyncio.set_event_loop(loop)
     yield loop
     loop.close()
-    asyncio.set_event_loop(None)
-
 
 @pytest.fixture
-async def sync_manager(event_loop, mock_web3):
+async def web3_mock():
+    """Create a mock Web3 instance."""
+    mock = AsyncMock()
+    mock.__class__ = AsyncWeb3
+    mock.eth = AsyncMock()
+    mock.eth.block_number = AsyncMock(return_value=1000)
+    mock.eth.get_block = AsyncMock(return_value={
+        'number': 900,
+        'hash': '0x123',
+        'transactions': []
+    })
+    mock.eth.chain_id = AsyncMock(return_value=1)
+    mock.is_connected = AsyncMock(return_value=True)
+
+    # Mock provider
+    mock_provider = AsyncMock()
+    mock_provider.is_connected = AsyncMock(return_value=True)
+    mock.provider = mock_provider
+
+    return mock
+
+@pytest.fixture
+async def sync_manager(web3_mock):
     """Create a sync manager instance."""
     manager = SyncManager()
     await manager.start()
@@ -35,27 +52,10 @@ async def sync_manager(event_loop, mock_web3):
             "chain_id": 1
         }
     }
+    await manager.configure(config)
 
-    with patch.object(AsyncWeb3, '__new__', return_value=mock_web3):
-        await manager.configure(config)
-        yield manager
-        await manager.stop()
-
-
-@pytest.fixture
-async def mock_web3():
-    """Create a mock Web3 instance."""
-    mock = MagicMock(spec=AsyncWeb3)
-    mock.eth = MagicMock()
-    mock.eth.block_number = AsyncMock(return_value=1000)
-    mock.eth.get_block = AsyncMock(return_value={
-        'number': 900,
-        'hash': '0x123',
-        'transactions': []
-    })
-    mock.is_connected = AsyncMock(return_value=True)
-    yield mock
-
+    yield manager
+    await manager.stop()
 
 @pytest.mark.asyncio
 async def test_start_sync(sync_manager):
@@ -71,7 +71,6 @@ async def test_start_sync(sync_manager):
     assert status['current_block'] is not None
     assert status['chain_id'] == chain_id
 
-
 @pytest.mark.asyncio
 async def test_start_sync_already_running(sync_manager):
     """Test starting sync when already running."""
@@ -81,11 +80,10 @@ async def test_start_sync_already_running(sync_manager):
     await sync_manager.start_sync(chain_id)
 
     # Try starting second sync
-    with pytest.raises(BlockchainError) as exc_info:
+    with pytest.raises(ChainConnectionError) as exc_info:
         await sync_manager.start_sync(chain_id)
 
     assert "already running" in str(exc_info.value)
-
 
 @pytest.mark.asyncio
 async def test_stop_sync(sync_manager):
@@ -102,17 +100,15 @@ async def test_stop_sync(sync_manager):
     status = await sync_manager.get_sync_status(chain_id)
     assert status['is_syncing'] is False
 
-
 @pytest.mark.asyncio
 async def test_stop_sync_not_running(sync_manager):
     """Test stopping sync when not running."""
     chain_id = "nonexistent_chain"
 
-    with pytest.raises(BlockchainError) as exc_info:
+    with pytest.raises(ChainConnectionError) as exc_info:
         await sync_manager.stop_sync(chain_id)
 
     assert "No sync running" in str(exc_info.value)
-
 
 @pytest.mark.asyncio
 async def test_get_sync_status(sync_manager):
@@ -131,17 +127,15 @@ async def test_get_sync_status(sync_manager):
     assert status['latest_block'] is not None
     assert status['blocks_remaining'] is not None
 
-
 @pytest.mark.asyncio
 async def test_get_sync_status_not_found(sync_manager):
     """Test getting sync status for non-existent chain."""
     chain_id = "nonexistent_chain"
 
-    with pytest.raises(BlockchainError) as exc_info:
+    with pytest.raises(ChainConnectionError) as exc_info:
         await sync_manager.get_sync_status(chain_id)
 
     assert "No sync found" in str(exc_info.value)
-
 
 @pytest.mark.asyncio
 async def test_sync_blockchain(sync_manager):
@@ -159,16 +153,15 @@ async def test_sync_blockchain(sync_manager):
     assert status['current_block'] is not None
     assert status['blocks_remaining'] is not None
 
-
 @pytest.mark.asyncio
-async def test_reorg_detection(sync_manager, mock_web3):
+async def test_reorg_detection(sync_manager, web3_mock):
     """Test blockchain reorganization detection."""
     chain_id = "test_chain"
 
     # Mock blocks for reorg scenario
     block1 = {'number': 1000, 'hash': '0x123', 'transactions': []}
     block2 = {'number': 1000, 'hash': '0x456', 'transactions': []}  # Different hash
-    mock_web3.eth.get_block.side_effect = [block1, block2]
+    web3_mock.eth.get_block.side_effect = [block1, block2]
 
     # Start sync
     await sync_manager.start_sync(chain_id)
@@ -180,14 +173,13 @@ async def test_reorg_detection(sync_manager, mock_web3):
     status = await sync_manager.get_sync_status(chain_id)
     assert status['reorg_detected'] is True
 
-
 @pytest.mark.asyncio
-async def test_web3_error_handling(sync_manager, mock_web3):
+async def test_web3_error_handling(sync_manager, web3_mock):
     """Test Web3 error handling during sync."""
     chain_id = "test_chain"
 
     # Mock Web3 error
-    mock_web3.eth.get_block.side_effect = Web3Exception("Connection error")
+    web3_mock.eth.get_block.side_effect = ChainConnectionError("Connection error")
 
     # Start sync and verify error handling
     await sync_manager.start_sync(chain_id)

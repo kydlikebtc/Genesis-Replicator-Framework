@@ -27,7 +27,8 @@ async def bnb_chain_adapter():
 @pytest.fixture
 async def web3_mock():
     """Create Web3 mock for BNB Chain testing."""
-    mock = AsyncMock(spec=AsyncWeb3)
+    mock = AsyncMock()
+    mock.__class__ = AsyncWeb3
     eth_mock = AsyncMock()
 
     # Setup eth mock methods
@@ -70,7 +71,7 @@ async def test_bnb_chain_transaction_batch(bnb_chain_adapter, web3_mock):
     processor = BatchProcessor()
 
     # Configure batch processor for BNB Chain
-    processor.configure(
+    await processor.configure_chain(
         chain_id=56,  # BNB Chain ID
         batch_size=50,  # BNB Chain optimal batch size
         batch_interval=0.1,
@@ -158,7 +159,7 @@ async def test_bnb_chain_performance(bnb_chain_adapter, web3_mock):
     processor = BatchProcessor()
 
     # Configure for high throughput
-    processor.configure(
+    await processor.configure_chain(
         chain_id=56,
         batch_size=100,
         batch_interval=0.05,

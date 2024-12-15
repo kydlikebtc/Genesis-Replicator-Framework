@@ -6,8 +6,9 @@ from typing import Any, Dict, Optional, Union
 from web3 import AsyncWeb3
 from web3.exceptions import InvalidAddress, Web3Exception
 from web3.types import TxParams, Wei
+from web3.providers import AsyncHTTPProvider
 
-from ..exceptions import ChainConnectionError, TransactionError
+from ..exceptions import ChainConnectionError, ConfigurationError, TransactionError
 from .base import BaseProtocolAdapter
 
 
@@ -24,8 +25,14 @@ class EthereumAdapter(BaseProtocolAdapter):
     async def configure_web3(self, provider_url: str) -> None:
         """Configure Web3 instance for Ethereum."""
         try:
-            provider = AsyncWeb3.AsyncHTTPProvider(provider_url)
-            self.web3 = AsyncWeb3(provider)
+            if not provider_url:
+                raise ConfigurationError("Provider URL cannot be empty")
+
+            # Create Web3 instance and set provider
+            self.web3 = AsyncWeb3()
+            provider = AsyncHTTPProvider(provider_url)
+            self.web3.provider = provider
+
             if not await self.web3.is_connected():
                 raise ChainConnectionError("Failed to connect to Ethereum node")
 

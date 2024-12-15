@@ -6,6 +6,7 @@ from typing import Any, Dict, Optional, Union
 from web3 import AsyncWeb3
 from web3.exceptions import InvalidAddress, Web3Exception
 from web3.types import TxParams, Wei
+from web3.providers import AsyncHTTPProvider
 
 from ..exceptions import ChainConnectionError, TransactionError
 from .base import BaseProtocolAdapter
@@ -24,8 +25,11 @@ class BNBChainAdapter(BaseProtocolAdapter):
     async def configure_web3(self, provider_url: str) -> None:
         """Configure Web3 instance for BNB Chain."""
         try:
-            provider = AsyncWeb3.AsyncHTTPProvider(provider_url)
-            self.web3 = AsyncWeb3(provider)
+            # Create Web3 instance and set provider
+            self.web3 = AsyncWeb3()
+            provider = AsyncHTTPProvider(provider_url)
+            self.web3.provider = provider
+
             if not await self.web3.is_connected():
                 raise ChainConnectionError("Failed to connect to BNB Chain node")
 

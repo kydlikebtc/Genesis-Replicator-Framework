@@ -103,8 +103,9 @@ class BatchProcessor:
             if self._batch_queue and not self._processing:
                 await self._process_batch()
 
-    def configure(
+    async def configure_chain(
         self,
+        chain_id: int,
         batch_size: Optional[int] = None,
         batch_interval: Optional[float] = None,
         max_retries: Optional[int] = None
@@ -112,6 +113,7 @@ class BatchProcessor:
         """Configure batch processor parameters.
 
         Args:
+            chain_id: Chain identifier
             batch_size: Number of transactions per batch
             batch_interval: Interval between batch processing
             max_retries: Maximum number of retry attempts

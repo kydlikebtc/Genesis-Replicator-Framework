@@ -378,11 +378,42 @@ class ContractManager:
 
         Raises:
             ContractError: If method call fails
+            ChainConnectionError: If chain is not connected
+            SecurityError: If input validation fails
         """
         try:
+            # Validate chain connection
+            if chain_id not in self._web3_instances:
+                raise ChainConnectionError(
+                    f"Chain {chain_id} not connected",
+                    details={"chain_id": chain_id}
+                )
+
+            # Validate contract address
+            if not self._validate_input(contract_address):
+                raise SecurityError(
+                    "Invalid contract address",
+                    details={
+                        "chain_id": chain_id,
+                        "contract_address": contract_address
+                    }
+                )
+
+            # Check contract exists
             if contract_address not in self._contracts:
                 raise ContractError(
                     f"Contract not found: {contract_address}",
+                    details={
+                        "chain_id": chain_id,
+                        "contract_address": contract_address
+                    }
+                )
+
+            # Verify contract code exists on chain
+            deployed_code = await web3.eth.get_code(contract_address)
+            if deployed_code == '0x' or deployed_code == b'0x' or deployed_code == b'':
+                raise ContractError(
+                    "Contract not deployed or destroyed",
                     details={
                         "chain_id": chain_id,
                         "contract_address": contract_address
@@ -396,7 +427,7 @@ class ContractManager:
             )
 
             # Get contract method
-            method = getattr(contract.functions, method_name)
+            method = getattr(contract.functions, method_name, None)
             if method is None:
                 raise ContractError(
                     f"Method not found: {method_name}",
@@ -430,6 +461,8 @@ class ContractManager:
                     "error": str(e)
                 }
             )
+        except (ChainConnectionError, SecurityError) as e:
+            raise e
         except Exception as e:
             raise ContractError(
                 f"Unexpected error calling contract method: {str(e)}",
