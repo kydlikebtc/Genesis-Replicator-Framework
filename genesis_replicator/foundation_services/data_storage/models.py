@@ -5,10 +5,11 @@ from datetime import datetime
 from typing import Any, Dict
 
 from sqlalchemy import JSON, Column, DateTime, Integer, String
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import Mapped
+from sqlalchemy.orm import DeclarativeBase, Mapped
 
-Base = declarative_base()
+class Base(DeclarativeBase):
+    """Base class for all models."""
+    pass
 
 class Agent(Base):
     """Base model for storing agent information."""

@@ -19,8 +19,7 @@ class Database:
         self._engine: Engine = create_engine(
             connection_url,
             pool_pre_ping=True,  # Enable connection health checks
-            pool_size=5,         # Default connection pool size
-            max_overflow=10      # Maximum number of connections
+            pool_size=5          # Default connection pool size
         )
         self._session_factory = sessionmaker(bind=self._engine)
 
