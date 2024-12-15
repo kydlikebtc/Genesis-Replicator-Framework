@@ -25,6 +25,21 @@ class TransactionManager:
         self._transaction_batches: Dict[str, List[str]] = {}
         self._nonce_locks: Dict[str, asyncio.Lock] = {}
         self._lock = asyncio.Lock()
+        self._initialized = False
+
+    async def start(self) -> None:
+        """Initialize and start the transaction manager.
+
+        This method should be called before any other operations.
+        """
+        if self._initialized:
+            return
+
+        async with self._lock:
+            self._initialized = True
+            self._pending_transactions.clear()
+            self._transaction_batches.clear()
+            self._nonce_locks.clear()
 
     async def submit_transaction(
         self,

@@ -26,7 +26,22 @@ class SyncManager:
         self._reorg_monitors: Dict[str, asyncio.Task] = {}
         self._processed_blocks: Dict[str, Set[int]] = {}
         self._lock = asyncio.Lock()
+        self._initialized = False
 
+    async def start(self) -> None:
+        """Initialize and start the sync manager.
+
+        This method should be called before any other operations.
+        """
+        if self._initialized:
+            return
+
+        async with self._lock:
+            self._initialized = True
+            self._sync_tasks.clear()
+            self._sync_states.clear()
+            self._reorg_monitors.clear()
+            self._processed_blocks.clear()
     async def start_sync(
         self,
         chain_id: str,

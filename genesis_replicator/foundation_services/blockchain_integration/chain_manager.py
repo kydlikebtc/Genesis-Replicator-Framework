@@ -23,6 +23,21 @@ class ChainManager:
         self._chain_configs: Dict[str, Dict[str, Any]] = {}
         self._status_monitors: Dict[str, asyncio.Task] = {}
         self._lock = asyncio.Lock()
+        self._initialized = False
+
+    async def start(self) -> None:
+        """Initialize and start the chain manager.
+
+        This method should be called before any other operations.
+        """
+        if self._initialized:
+            return
+
+        async with self._lock:
+            self._initialized = True
+            self._connections.clear()
+            self._chain_configs.clear()
+            self._status_monitors.clear()
 
     async def connect_to_chain(self, chain_id: str, endpoint_url: str, **config) -> None:
         """Connect to a blockchain network.

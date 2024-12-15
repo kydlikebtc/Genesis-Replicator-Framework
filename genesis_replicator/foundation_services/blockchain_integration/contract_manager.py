@@ -25,6 +25,7 @@ class ContractManager:
         self._contracts: Dict[str, Dict[str, Any]] = {}
         self._abis: Dict[str, Dict[str, Any]] = {}
         self._lock = asyncio.Lock()
+        self._initialized = False
 
     async def deploy_contract(
         self,
