@@ -24,6 +24,8 @@ class ChainManager:
         self._chain_configs: Dict[str, Dict[str, Any]] = {}
         self._status_monitors: Dict[str, asyncio.Task] = {}
         self._lock = asyncio.Lock()
+        self._connection_semaphore = asyncio.Semaphore(10)  # Limit concurrent connections
+        self._connection_pool: Dict[str, List[AsyncWeb3]] = {}
         self._initialized = False
 
     async def start(self) -> None:
@@ -117,19 +119,39 @@ class ChainManager:
             ChainConnectionError: If connection fails
         """
         try:
-            async with self._lock:
-                if chain_id in self._connections:
-                    raise ChainConnectionError(
-                        f"Chain {chain_id} already connected",
-                        details={"chain_id": chain_id}
-                    )
+            async with self._connection_semaphore:  # Limit concurrent connections
+                async with self._lock:
+                    if chain_id in self._connections:
+                        raise ChainConnectionError(
+                            f"Chain {chain_id} already connected",
+                            details={"chain_id": chain_id}
+                        )
 
-                web3 = AsyncWeb3(AsyncWeb3.AsyncHTTPProvider(endpoint_url))
-                # Test connection
-                await web3.eth.chain_id
+                    # Initialize connection pool for this chain
+                    if chain_id not in self._connection_pool:
+                        self._connection_pool[chain_id] = []
 
-                self._connections[chain_id] = web3
-                self._chain_configs[chain_id] = config
+                    web3 = AsyncWeb3(AsyncWeb3.AsyncHTTPProvider(endpoint_url))
+
+                    # Test connection
+                    try:
+                        await asyncio.wait_for(web3.eth.chain_id, timeout=5.0)
+                    except asyncio.TimeoutError:
+                        raise ChainConnectionError(
+                            f"Connection timeout for chain {chain_id}",
+                            details={"chain_id": chain_id, "endpoint_url": endpoint_url}
+                        )
+
+                    # Add to pool and set as primary connection
+                    self._connection_pool[chain_id].append(web3)
+                    self._connections[chain_id] = web3
+                    self._chain_configs[chain_id] = config
+
+                    # Start monitoring task
+                    if chain_id not in self._status_monitors:
+                        self._status_monitors[chain_id] = asyncio.create_task(
+                            self._monitor_chain_status(chain_id)
+                        )
 
         except Web3Exception as e:
             raise ChainConnectionError(
@@ -277,3 +299,64 @@ class ChainManager:
                     "error": str(e)
                 }
             )
+
+    async def _monitor_chain_status(self, chain_id: str) -> None:
+        """Monitor chain status and manage connection pool.
+
+        Args:
+            chain_id: Chain identifier to monitor
+        """
+        while True:
+            try:
+                await asyncio.sleep(30)  # Check every 30 seconds
+
+                async with self._lock:
+                    if chain_id not in self._connections:
+                        break
+
+                    web3 = self._connections[chain_id]
+                    try:
+                        # Test connection
+                        await asyncio.wait_for(web3.eth.chain_id, timeout=5.0)
+                    except (Web3Exception, asyncio.TimeoutError):
+                        # Remove failed connection from pool
+                        if chain_id in self._connection_pool:
+                            pool = self._connection_pool[chain_id]
+                            if web3 in pool:
+                                pool.remove(web3)
+
+                            # Try to switch to another connection from pool
+                            if pool:
+                                self._connections[chain_id] = pool[0]
+                            else:
+                                # No more connections available
+                                del self._connections[chain_id]
+                                del self._chain_configs[chain_id]
+                                if chain_id in self._connection_pool:
+                                    del self._connection_pool[chain_id]
+                                break
+
+            except Exception as e:
+                # Log error but continue monitoring
+                print(f"Error monitoring chain {chain_id}: {str(e)}")
+                continue
+
+    async def _get_connection(self, chain_id: str) -> AsyncWeb3:
+        """Get an available connection from the pool.
+
+        Args:
+            chain_id: Chain identifier
+
+        Returns:
+            AsyncWeb3 connection
+
+        Raises:
+            ChainConnectionError: If no connection available
+        """
+        async with self._lock:
+            if chain_id not in self._connection_pool or not self._connection_pool[chain_id]:
+                raise ChainConnectionError(
+                    f"No connections available for chain {chain_id}",
+                    details={"chain_id": chain_id}
+                )
+            return self._connection_pool[chain_id][0]  # Use first available connection
