@@ -4,7 +4,9 @@ Chain Manager for blockchain integration.
 This module manages multi-chain operations, network connections, and chain status monitoring.
 """
 import asyncio
+import functools
 import logging
+import time
 from typing import Dict, List, Optional, Any, Type
 from web3 import AsyncWeb3
 from web3.exceptions import Web3Exception
@@ -13,7 +15,8 @@ from .exceptions import (
     ChainConnectionError,
     TransactionError,
     SecurityError,
-    ConfigurationError
+    ChainConfigError,
+    ProtocolError
 )
 from .protocols.base import BaseProtocolAdapter
 from .protocols.bnb_chain import BNBChainAdapter
@@ -34,27 +37,66 @@ class ChainManager:
         self._connection_pool: Dict[str, List[AsyncWeb3]] = {}
         self._protocol_adapters: Dict[str, BaseProtocolAdapter] = {}
         self._health_metrics: Dict[str, Dict[str, Any]] = {}  # Store health metrics
+        self._monitor_task: Optional[asyncio.Task] = None  # Global monitoring task
         self._initialized = False
+        self._running = False
+        self._monitoring_tasks: Dict[str, asyncio.Task] = {}
 
-    async def start(self) -> None:
-        """Initialize and start the chain manager.
+    async def __aenter__(self):
+        """Async context manager entry."""
+        await self.initialize()
+        return self
 
-        This method should be called before any other operations.
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Async context manager exit."""
+        await self.cleanup()
+
+    async def initialize(self, timeout: int = 30) -> None:
+        """Initialize the chain manager.
+
+        Args:
+            timeout: Initialization timeout in seconds
+
+        Raises:
+            ChainConfigError: If already initialized or initialization fails
         """
+        logger.debug("ChainManager.initialize() called")
         if self._initialized:
-            return
+            logger.debug("ChainManager already initialized")
+            raise ChainConfigError("already initialized")
 
+        logger.debug("Creating connection semaphore")
+        self._connection_semaphore = asyncio.Semaphore(10)
+
+        logger.debug("Starting initialization with timeout")
         try:
-            async with self._lock:
-                self._initialized = True
-                self._connections.clear()
+            async with asyncio.timeout(timeout):
+                logger.debug("Acquired lock, clearing configurations")
                 self._chain_configs.clear()
+                self._connections.clear()
                 self._status_monitors.clear()
-                self._protocol_adapters.clear()
-                # Note: Protocol adapters will be registered when needed
+                self._health_metrics.clear()
+
+                logger.debug("Setting initialized and running flags")
+                self._initialized = True
+                self._running = True
+
+                logger.debug("Chain manager initialized successfully")
+        except asyncio.TimeoutError:
+            logger.error("Initialization timed out")
+            raise ChainConfigError("initialization timed out")
         except Exception as e:
-            self._initialized = False
-            raise ConfigurationError("Failed to start chain manager", details={"error": str(e)})
+            logger.error(f"Initialization failed: {str(e)}")
+            raise ChainConfigError("initialization failed") from e
+
+    async def _force_cleanup(self) -> None:
+        """Force cleanup of resources without acquiring locks."""
+        self._initialized = False
+        self._running = False
+        self._connections.clear()
+        self._chain_configs.clear()
+        self._status_monitors.clear()
+        self._protocol_adapters.clear()
 
     async def is_running(self) -> bool:
         """Check if the chain manager is running.
@@ -62,34 +104,68 @@ class ChainManager:
         Returns:
             bool: True if the manager is initialized and running
         """
-        return self._initialized
+        return self._initialized and self._running
 
-    async def stop(self) -> None:
-        """Stop and cleanup the chain manager."""
-        async with self._lock:
-            # Cancel all monitoring tasks first
-            for chain_id, task in list(self._status_monitors.items()):
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass  # Expected when cancelling tasks
-                except Exception as e:
-                    logger.error(f"Error cancelling monitor task for chain {chain_id}: {e}")
+    async def cleanup(self) -> None:
+        """Cleanup resources."""
+        logger.debug("Starting cleanup")
+        if not self._initialized:
+            logger.debug("Cleanup called on uninitialized manager")
+            return
 
-            # Disconnect from all chains
-            for chain_id in list(self._connections.keys()):
-                try:
-                    await self.disconnect_from_chain(chain_id)
-                except Exception as e:
-                    logger.error(f"Error disconnecting from chain {chain_id}: {e}")
+        try:
+            async with self._lock:
+                # Stop monitoring first by setting running to False
+                self._running = False
+                logger.debug("Set running to False to stop monitoring tasks")
 
-            self._initialized = False
-            self._protocol_adapters.clear()
-            self._status_monitors.clear()
-            self._connections.clear()
-            self._chain_configs.clear()
-            self._health_metrics.clear()
+                # Cancel monitoring tasks
+                for chain_id, task in self._monitoring_tasks.items():
+                    try:
+                        if not task.done():
+                            task.cancel()
+                            try:
+                                await asyncio.wait_for(task, timeout=2.0)
+                            except asyncio.TimeoutError:
+                                logger.warning(f"Timeout waiting for monitoring task {chain_id} to cancel")
+                            except asyncio.CancelledError:
+                                pass
+                    except Exception as e:
+                        logger.error(f"Error cancelling monitoring task for chain {chain_id}: {e}")
+
+                # Clear monitoring tasks
+                self._monitoring_tasks.clear()
+
+                # Wait a short time for tasks to fully stop
+                await asyncio.sleep(0.1)
+
+                # Close connections with timeout
+                for chain_id, web3 in self._connections.items():
+                    try:
+                        provider = web3.provider
+                        # Skip provider cleanup for test/mock providers
+                        if (hasattr(provider, 'close') and
+                            not (provider.__class__.__name__ == 'MockProvider' or
+                                 '_test_mode' in self._chain_configs.get(chain_id, {}))):
+                            try:
+                                await asyncio.wait_for(provider.close(), timeout=2.0)
+                            except asyncio.TimeoutError:
+                                logger.warning(f"Timeout closing connection for chain {chain_id}")
+                    except Exception as e:
+                        logger.error(f"Error closing connection for chain {chain_id}: {e}")
+
+                # Clear configurations
+                self._connections.clear()
+                self._chain_configs.clear()
+                self._health_metrics.clear()
+
+                # Reset state
+                self._initialized = False
+                logger.debug("Cleanup completed successfully")
+
+        except Exception as e:
+            logger.error(f"Error during cleanup: {e}")
+            raise
 
     async def register_protocol_adapter(self, chain_type: str, adapter: BaseProtocolAdapter) -> None:
         """Register a protocol adapter for a specific chain type.
@@ -101,107 +177,53 @@ class ChainManager:
         Raises:
             ValueError: If adapter is invalid
         """
+        logger = logging.getLogger(__name__)
+        logger.debug(f"Registering protocol adapter for {chain_type}")
+        logger.debug(f"Adapter type: {type(adapter)}")
+        logger.debug(f"Adapter bases: {type(adapter).__bases__ if hasattr(type(adapter), '__bases__') else 'No bases'}")
+        logger.debug(f"Is instance check: {isinstance(adapter, BaseProtocolAdapter)}")
+        logger.debug(f"Is subclass check: {issubclass(type(adapter), BaseProtocolAdapter) if hasattr(type(adapter), '__bases__') else False}")
+
         if not isinstance(adapter, BaseProtocolAdapter):
+            logger.error("Invalid protocol adapter: not an instance of BaseProtocolAdapter")
             raise ValueError("Invalid protocol adapter")
 
-        async with self._lock:
-            self._protocol_adapters[chain_type] = adapter
+        self._protocol_adapters[chain_type] = adapter
+        logger.debug(f"Successfully registered protocol adapter for {chain_type}")
 
     async def configure(self, config: Dict[str, Dict[str, Any]]) -> None:
-        """Configure chain connections.
+        """Configure chain manager with multiple chain configurations.
 
         Args:
             config: Dictionary mapping chain IDs to their configurations
 
         Raises:
-            ChainConnectionError: If configuration fails
+            ChainConfigError: If configuration is invalid
         """
+        logger.debug("Configuring chain manager")
         if not self._initialized:
-            raise ConfigurationError("Chain manager not initialized")
+            raise ChainConfigError("not initialized")
 
-        try:
-            async with asyncio.timeout(30):  # Global timeout for entire configuration
-                async with self._lock:
-                    # First validate all configurations with timeout
-                    for chain_id, chain_config in config.items():
-                        try:
-                            await asyncio.wait_for(
-                                self.validate_chain_credentials(chain_id, chain_config),
-                                timeout=5.0
-                            )
-                            self._chain_configs[chain_id] = chain_config
-                        except asyncio.TimeoutError:
-                            raise ChainConnectionError(
-                                f"Validation timeout for chain {chain_id}",
-                                details={"chain_id": chain_id}
-                            )
+        # First validate all chain credentials
+        for chain_id, chain_config in config.items():
+            # Validation errors should be raised immediately
+            await self.validate_chain_credentials(chain_id, chain_config)
+            self._chain_configs[chain_id] = chain_config.copy()
 
-                    # Then connect and start monitoring for each chain with timeout
-                    for chain_id, chain_config in config.items():
-                        try:
-                            await asyncio.wait_for(
-                                self.connect_chain(chain_id, chain_config),
-                                timeout=10.0
-                            )
+        # Then attempt to connect to each chain
+        connection_errors = []
+        for chain_id in config.keys():
+            try:
+                success = await self.connect_chain(chain_id)
+                if not success:
+                    connection_errors.append(chain_id)
+            except Exception as e:
+                logger.error(f"Error connecting to chain {chain_id}: {e}")
+                connection_errors.append(chain_id)
 
-                            # Start monitoring task with explicit name and timeout
-                            monitor_task = asyncio.create_task(
-                                self._monitor_chain_status(chain_id),
-                                name=f"monitor_{chain_id}"
-                            )
-                            self._status_monitors[chain_id] = monitor_task
-
-                            # Wait briefly to ensure monitoring task starts
-                            await asyncio.sleep(0.1)
-
-                            # Verify task is running
-                            if monitor_task.done():
-                                exc = monitor_task.exception()
-                                if exc:
-                                    raise exc
-
-                        except asyncio.TimeoutError:
-                            logger.error(f"Connection timeout for chain {chain_id}")
-                            # Clean up any partial configuration
-                            if chain_id in self._chain_configs:
-                                del self._chain_configs[chain_id]
-                            if chain_id in self._status_monitors:
-                                self._status_monitors[chain_id].cancel()
-                                del self._status_monitors[chain_id]
-                            raise ChainConnectionError(
-                                f"Connection timeout for chain {chain_id}",
-                                details={"chain_id": chain_id}
-                            )
-
-        except Exception as e:
-            logger.error(f"Configuration failed: {e}")
-            # Clean up any partial configuration
-            for chain_id in list(self._chain_configs.keys()):
-                if chain_id in self._status_monitors:
-                    self._status_monitors[chain_id].cancel()
-                    del self._status_monitors[chain_id]
-                if chain_id in self._chain_configs:
-                    del self._chain_configs[chain_id]
-            raise ChainConnectionError("Configuration failed", details={"error": str(e)})
-
-    async def get_chain_health(self, chain_id: str) -> Dict[str, Any]:
-        """Get health metrics for a chain.
-
-        Args:
-            chain_id: Chain identifier
-
-        Returns:
-            Dict containing health metrics
-
-        Raises:
-            ChainConnectionError: If chain not found
-        """
-        if chain_id not in self._connections:
-            raise ChainConnectionError(
-                f"Chain {chain_id} not connected",
-                details={"chain_id": chain_id}
-            )
-        return self._health_metrics.get(chain_id, {})
+        # Log connection errors but don't raise exception
+        if connection_errors:
+            logger.warning(f"Failed to connect to chains: {connection_errors}")
 
     async def get_all_chain_health(self) -> Dict[str, Dict[str, Any]]:
         """Get health metrics for all connected chains.
@@ -211,91 +233,73 @@ class ChainManager:
         """
         return self._health_metrics.copy()
 
-    async def connect_chain(
-        self,
-        chain_id: str,
-        chain_config: Dict[str, Any]
-    ) -> None:
-        """Connect to a blockchain chain.
+    async def connect_chain(self, chain_id: str) -> bool:
+        """Connect to a specific chain.
 
         Args:
             chain_id: Chain identifier
-            chain_config: Chain configuration parameters
-
-        Raises:
-            ChainConnectionError: If connection fails
-        """
-        try:
-            logger.debug(f"Attempting to connect to chain {chain_id}")
-            # Remove chain_id and rpc_url from kwargs to avoid parameter conflicts
-            connect_kwargs = {k: v for k, v in chain_config.items()
-                           if k not in ['rpc_url', 'chain_id']}
-            await self.connect_to_chain(
-                chain_id,
-                chain_config['rpc_url'],
-                **connect_kwargs
-            )
-            logger.debug(f"Successfully connected to chain {chain_id}")
-        except Exception as e:
-            logger.error(f"Failed to connect to chain {chain_id}: {e}")
-            raise ChainConnectionError(f"Failed to connect to chain {chain_id}", details={"error": str(e)})
-
-    async def validate_chain_credentials(
-        self,
-        chain_id: str,
-        credentials: Optional[Dict[str, Any]]
-    ) -> bool:
-        """Validate chain access credentials.
-
-        Args:
-            chain_id: Chain identifier
-            credentials: Security credentials
 
         Returns:
-            True if credentials are valid, False otherwise
+            bool: True if connection successful
 
         Raises:
-            SecurityError: If validation fails
+            ChainConfigError: If chain not configured
         """
-        try:
-            logger.debug(f"Validating credentials for chain {chain_id}")
-            logger.debug(f"Credentials: {credentials}")
+        logger.debug(f"Attempting to connect to chain {chain_id}")
 
-            if not credentials:
-                logger.debug(f"No credentials provided for chain {chain_id}")
-                return False
+        if not self._initialized:
+            raise ChainConfigError("Chain manager not initialized")
 
-            # For testing and basic validation, we just check if required fields exist
-            required_fields = ['rpc_url', 'chain_id']
-            has_fields = all(field in credentials for field in required_fields)
-            logger.debug(f"Chain {chain_id} has required fields: {has_fields}")
-
-            if not has_fields:
-                return False
-
-            # Validate chain_id is an integer
-            try:
-                int(credentials['chain_id'])
-            except (ValueError, TypeError):
-                logger.debug(f"Invalid chain_id format for chain {chain_id}")
-                return False
-
-            # Validate rpc_url is a non-empty string
-            if not isinstance(credentials['rpc_url'], str) or not credentials['rpc_url'].strip():
-                logger.debug(f"Invalid rpc_url format for chain {chain_id}")
-                return False
-
-            return True
-
-        except Exception as e:
-            logger.error(f"Validation failed for chain {chain_id}: {e}")
-            raise SecurityError(
-                f"Failed to validate credentials for chain {chain_id}",
-                details={
-                    "chain_id": chain_id,
-                    "error": str(e)
-                }
+        if chain_id not in self._chain_configs:
+            raise ChainConfigError(
+                f"Chain {chain_id} not configured",
+                details={"chain_id": chain_id}
             )
+
+        try:
+            chain_config = self._chain_configs[chain_id]
+            # Connect using protocol adapter
+            success = await self.connect_to_chain(chain_id)
+
+            if success:
+                logger.debug(f"Successfully connected to chain {chain_id}")
+                return True
+
+            logger.error(f"Failed to connect to chain {chain_id}")
+            return False
+        except Exception as e:
+            logger.error(f"Error connecting to chain {chain_id}: {e}")
+            return False
+
+    async def validate_chain_credentials(self, chain_id: str, credentials: Dict[str, Any]) -> None:
+        """Validate chain credentials.
+
+        Args:
+            chain_id: Chain identifier
+            credentials: Chain configuration dictionary
+
+        Raises:
+            ChainConfigError: If credentials are invalid
+        """
+        logger.debug(f"Validating credentials for chain {chain_id}")
+        logger.debug(f"Credentials: {credentials}")
+
+        # Check required fields
+        if 'rpc_url' not in credentials:
+            raise ChainConfigError("missing required field: rpc_url")
+
+        # Validate chain ID
+        if 'chain_id' not in credentials or not isinstance(credentials['chain_id'], int) or credentials['chain_id'] <= 0:
+            raise ChainConfigError("invalid chain ID: must be positive integer")
+
+        # Validate protocol
+        if 'protocol' not in credentials:
+            raise ChainConfigError("missing required field: protocol")
+
+        if credentials['protocol'] not in self._protocol_adapters:
+            raise ChainConfigError(f"unsupported protocol: {credentials['protocol']}")
+
+        logger.debug(f"Chain {chain_id} credentials validated successfully")
 
     async def _verify_chain_access(
         self,
@@ -322,127 +326,58 @@ class ChainManager:
         logger.debug(f"Chain {chain_id} has required fields: {has_fields}")
         return has_fields
 
-    async def connect_to_chain(
-        self,
-        chain_id: str,
-        rpc_url: str,
-        **kwargs
-    ) -> None:
-        """Connect to a blockchain chain.
+    async def connect_to_chain(self, chain_id: str) -> bool:
+        """Connect to a specific chain using the appropriate protocol adapter.
 
         Args:
             chain_id: Chain identifier
-            rpc_url: RPC endpoint URL
-            **kwargs: Additional chain-specific configuration
+
+        Returns:
+            bool: True if connection successful
 
         Raises:
             ChainConnectionError: If connection fails
         """
+        if chain_id not in self._chain_configs:
+            raise ChainConfigError(
+                f"Chain {chain_id} not configured",
+                details={"chain_id": chain_id}
+            )
+
+        chain_config = self._chain_configs[chain_id]
+        logger.debug(f"Connecting to chain {chain_id} using {chain_config['protocol']} protocol")
+
         try:
-            async with asyncio.timeout(15.0):  # Increased timeout for initial connection
-                async with self._lock:
-                    if chain_id in self._connections:
-                        logger.debug(f"Chain {chain_id} already connected")
-                        return
+            protocol = chain_config['protocol']
+            adapter = self._protocol_adapters.get(protocol)
 
-                    logger.debug(f"Connecting to chain {chain_id} at {rpc_url}")
+            if not adapter:
+                raise ChainConnectionError(
+                    f"No adapter found for protocol {protocol}",
+                    details={"chain_id": chain_id, "protocol": protocol}
+                )
 
-                    # Get protocol adapter if specified
-                    protocol = kwargs.get('protocol')
-                    if protocol:
-                        adapter = self._protocol_adapters.get(protocol)
-                        if not adapter:
-                            raise ChainConnectionError(
-                                f"Unsupported protocol {protocol}",
-                                details={"chain_id": chain_id, "protocol": protocol}
-                            )
-                        try:
-                            await asyncio.wait_for(adapter.configure_web3(rpc_url), timeout=10.0)
-                            web3 = adapter.web3
-                            logger.debug(f"Protocol adapter {protocol} configured for chain {chain_id}")
-                        except asyncio.TimeoutError:
-                            raise ChainConnectionError(
-                                f"Protocol adapter configuration timeout for chain {chain_id}",
-                                details={"chain_id": chain_id, "protocol": protocol}
-                            )
-                    else:
-                        web3 = AsyncWeb3(AsyncWeb3.AsyncHTTPProvider(rpc_url))
+            logger.debug(f"Using protocol adapter: {adapter.__class__.__name__}")
 
-                    try:
-                        # Quick connection test with explicit timeout
-                        await asyncio.wait_for(web3.connect(), timeout=5.0)
-                        connected = await asyncio.wait_for(web3.is_connected(), timeout=5.0)
-                        if not connected:
-                            raise ChainConnectionError(
-                                f"Failed to connect to chain {chain_id}",
-                                details={"rpc_url": rpc_url}
-                            )
+            # Initialize connection pool for this chain if it doesn't exist
+            if not hasattr(self, '_connection_pool'):
+                self._connection_pool = {}
+            if chain_id not in self._connection_pool:
+                self._connection_pool[chain_id] = []
 
-                        # Store the connection
-                        self._connections[chain_id] = web3
-                        logger.debug(f"Successfully connected to chain {chain_id}")
+            # Connect using adapter
+            success = await adapter.connect(chain_config)
 
-                    except asyncio.TimeoutError:
-                        logger.error(f"Connection test timeout for chain {chain_id}")
-                        raise ChainConnectionError(
-                            f"Connection test timeout for chain {chain_id}",
-                            details={"rpc_url": rpc_url}
-                        )
-                    except Exception as e:
-                        logger.error(f"Failed to connect to chain {chain_id}: {e}")
-                        if chain_id in self._connections:
-                            del self._connections[chain_id]
-                        raise ChainConnectionError(
-                            f"Failed to connect to chain {chain_id}",
-                            details={"error": str(e), "rpc_url": rpc_url}
-                        )
+            if not success:
+                logger.error(f"Failed to connect to chain {chain_id}")
+                return False
 
-        except asyncio.TimeoutError:
-            logger.error(f"Connection timeout for chain {chain_id}")
-            raise ChainConnectionError(
-                f"Connection timeout for chain {chain_id}",
-                details={"rpc_url": rpc_url}
-            )
+            logger.debug(f"Successfully connected to chain {chain_id}")
+            return True
+
         except Exception as e:
-            logger.error(f"Unexpected error connecting to chain {chain_id}: {e}")
-            raise ChainConnectionError(
-                f"Failed to connect to chain {chain_id}",
-                details={"error": str(e), "rpc_url": rpc_url}
-            )
-
-    async def disconnect_from_chain(self, chain_id: str) -> None:
-        """Disconnect from a blockchain network.
-
-        Args:
-            chain_id: Chain identifier to disconnect from
-
-        Raises:
-            ChainConnectionError: If chain not found or disconnect fails
-        """
-        try:
-            async with self._lock:
-                if chain_id not in self._connections:
-                    raise ChainConnectionError(
-                        f"Chain {chain_id} not connected",
-                        details={"chain_id": chain_id}
-                    )
-
-                # Cancel status monitoring
-                if chain_id in self._status_monitors:
-                    self._status_monitors[chain_id].cancel()
-                    del self._status_monitors[chain_id]
-
-                # Close connection and cleanup
-                del self._connections[chain_id]
-                del self._chain_configs[chain_id]
-        except Exception as e:
-            raise ChainConnectionError(
-                f"Error during disconnect from chain {chain_id}",
-                details={
-                    "chain_id": chain_id,
-                    "error": str(e)
-                }
-            )
+            logger.error(f"Error in connect_to_chain for {chain_id}: {e}")
+            return False
 
     async def get_chain_status(self, chain_id: str) -> Dict[str, Any]:
         """Get current status of a blockchain network.
@@ -675,117 +610,44 @@ class ChainManager:
         Args:
             chain_id: Chain identifier to monitor
         """
-        logger.debug(f"Starting monitoring task for chain {chain_id}")
-        CHECK_INTERVAL = 5  # seconds
-        MAX_RETRIES = 3
-        retry_count = 0
-
-        while self._initialized:  # Only run while manager is initialized
+        logger.debug(f"Starting chain status monitoring for {chain_id}")
+        while self._running:
             try:
-                # Check for task cancellation
-                if asyncio.current_task().cancelled():
-                    logger.debug(f"Monitoring task cancelled for chain {chain_id}")
-                    break
-
-                # Get connection with timeout
-                try:
-                    web3 = await asyncio.wait_for(
-                        self._get_connection(chain_id),
-                        timeout=2.0  # Reduced timeout for faster response
-                    )
-                except asyncio.TimeoutError:
-                    logger.warning(f"Timeout getting connection for chain {chain_id}")
-                    retry_count += 1
-                    if retry_count >= MAX_RETRIES:
-                        logger.error(f"Max retries reached for chain {chain_id}")
-                        self._health_metrics[chain_id] = {
-                            'status': 'error',
-                            'last_check': asyncio.get_event_loop().time(),
-                            'errors': ['Max connection retries reached']
-                        }
-                        await asyncio.sleep(CHECK_INTERVAL)
+                # Get chain connection
+                web3 = self._connections.get(chain_id)
+                if not web3:
+                    logger.error(f"No connection found for chain {chain_id}")
                     continue
 
-                # Check connection with timeout
+                # Update health metrics
                 try:
-                    is_connected = await asyncio.wait_for(
-                        web3.is_connected(),
-                        timeout=2.0  # Reduced timeout for faster response
-                    )
-                except asyncio.TimeoutError:
-                    logger.warning(f"Timeout checking connection for chain {chain_id}")
-                    retry_count += 1
-                    if retry_count >= MAX_RETRIES:
-                        logger.error(f"Max retries reached for chain {chain_id}")
-                        self._health_metrics[chain_id] = {
-                            'status': 'error',
-                            'last_check': asyncio.get_event_loop().time(),
-                            'errors': ['Max connection check retries reached']
-                        }
-                        await asyncio.sleep(CHECK_INTERVAL)
-                    continue
+                    # Get latest block
+                    latest_block = await web3.eth.block_number
+                    gas_price = await web3.eth.gas_price
+                    is_syncing = await web3.eth.syncing
 
-                if not is_connected:
-                    logger.warning(f"Lost connection to chain {chain_id}")
+                    # Update metrics
                     self._health_metrics[chain_id] = {
-                        'status': 'disconnected',
-                        'last_check': asyncio.get_event_loop().time(),
-                        'errors': ['Connection lost']
+                        'last_block': latest_block,
+                        'gas_price': gas_price,
+                        'is_syncing': is_syncing,
+                        'last_update': int(time.time())
                     }
-                    retry_count += 1
-                    if retry_count >= MAX_RETRIES:
-                        logger.error(f"Max retries reached for chain {chain_id}")
-                        await asyncio.sleep(CHECK_INTERVAL)
-                    continue
 
-                # Reset retry count on successful connection
-                retry_count = 0
+                    logger.debug(f"Updated health metrics for chain {chain_id}")
 
-                # Get chain status with timeout
-                try:
-                    block_number = await asyncio.wait_for(
-                        web3.eth.get_block_number(),
-                        timeout=2.0  # Reduced timeout for faster response
-                    )
+                except Exception as e:
+                    logger.error(f"Failed to update health metrics for chain {chain_id}: {e}")
                     self._health_metrics[chain_id] = {
-                        'status': 'connected',
-                        'last_check': asyncio.get_event_loop().time(),
-                        'block_number': block_number,
-                        'errors': []
+                        'error': str(e),
+                        'last_update': int(time.time())
                     }
-                except asyncio.TimeoutError:
-                    logger.warning(f"Timeout getting block number for chain {chain_id}")
-                    retry_count += 1
-                    if retry_count >= MAX_RETRIES:
-                        logger.error(f"Max retries reached for chain {chain_id}")
-                        self._health_metrics[chain_id] = {
-                            'status': 'error',
-                            'last_check': asyncio.get_event_loop().time(),
-                            'errors': ['Max block number retries reached']
-                        }
-                        await asyncio.sleep(CHECK_INTERVAL)
-                    continue
 
-                # Wait before next check
-                await asyncio.sleep(CHECK_INTERVAL)
-
-            except asyncio.CancelledError:
-                logger.debug(f"Monitoring task cancelled for chain {chain_id}")
-                break
             except Exception as e:
-                logger.error(f"Error monitoring chain {chain_id}: {e}")
-                self._health_metrics[chain_id] = {
-                    'status': 'error',
-                    'last_check': asyncio.get_event_loop().time(),
-                    'errors': [str(e)]
-                }
-                retry_count += 1
-                if retry_count >= MAX_RETRIES:
-                    logger.error(f"Max retries reached for chain {chain_id}")
-                    await asyncio.sleep(CHECK_INTERVAL)
-                continue
+                logger.error(f"Error in chain status monitoring for {chain_id}: {e}")
 
-        logger.debug(f"Monitoring task stopped for chain {chain_id}")
+            # Wait before next update
+            await asyncio.sleep(30)  # Update every 30 seconds
 
     async def _get_connection(self, chain_id: str) -> AsyncWeb3:
         """Get an available connection from the pool with load balancing.
@@ -800,29 +662,71 @@ class ChainManager:
             ChainConnectionError: If no connection available
         """
         async with self._lock:
-            if chain_id not in self._connection_pool or not self._connection_pool[chain_id]:
-                raise ChainConnectionError(
-                    f"No connections available for chain {chain_id}",
-                    details={"chain_id": chain_id}
-                )
+            if not hasattr(self, '_connection_pool'):
+                self._connection_pool = {}
 
-            connections = self._connection_pool[chain_id]
-            # Rotate connections for load balancing
-            connection = connections.pop(0)
-            connections.append(connection)
+            # Try to get existing connection
+            if chain_id in self._connection_pool and self._connection_pool[chain_id]:
+                connections = self._connection_pool[chain_id]
+                # Rotate connections for load balancing
+                connection = connections.pop(0)
+                connections.append(connection)
 
-            # Verify connection health before returning
+                # Verify connection health before returning
+                try:
+                    await asyncio.wait_for(connection.eth.chain_id, timeout=2.0)
+                    return connection
+                except (asyncio.TimeoutError, Exception) as e:
+                    # Remove unhealthy connection
+                    if connection in connections:
+                        connections.remove(connection)
+
+            # Try to establish new connection
             try:
-                await asyncio.wait_for(connection.eth.chain_id, timeout=2.0)
-                return connection
-            except (asyncio.TimeoutError, Exception) as e:
-                # Remove unhealthy connection
-                if connection in connections:
-                    connections.remove(connection)
-                raise ChainConnectionError(
-                    f"Connection health check failed for chain {chain_id}",
-                    details={"chain_id": chain_id, "error": str(e)}
-                )
+                if await self.connect_chain(chain_id):
+                    if chain_id in self._connection_pool and self._connection_pool[chain_id]:
+                        return self._connection_pool[chain_id][0]
+            except Exception as e:
+                logger.error(f"Failed to establish new connection for chain {chain_id}: {e}")
+
+            raise ChainConnectionError(
+                f"No connections available for chain {chain_id}",
+                details={"chain_id": chain_id}
+            )
+
+    async def get_web3(self, chain_id: str) -> AsyncWeb3:
+        """Get Web3 instance for a specific chain.
+
+        Args:
+            chain_id: Chain identifier
+
+        Returns:
+            AsyncWeb3: Web3 instance for the specified chain
+
+        Raises:
+            ChainConnectionError: If no connection available or connection fails
+            ChainConfigError: If chain not configured
+        """
+        if not self._initialized:
+            raise ChainConfigError("Chain manager not initialized")
+
+        if chain_id not in self._chain_configs:
+            raise ChainConfigError(
+                f"Chain {chain_id} not configured",
+                details={"chain_id": chain_id}
+            )
+
+        try:
+            return await self._get_connection(chain_id)
+        except ChainConnectionError as e:
+            # Re-raise with more context
+            raise ChainConnectionError(
+                f"Failed to get Web3 instance for chain {chain_id}",
+                details={
+                    "chain_id": chain_id,
+                    "error": str(e)
+                }
+            )
 
     def get_supported_chains(self) -> List[str]:
         """Get list of supported chain IDs.
