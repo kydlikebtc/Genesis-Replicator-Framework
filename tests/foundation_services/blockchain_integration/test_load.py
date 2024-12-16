@@ -26,35 +26,35 @@ async def managers():
     await chain_manager.start()
     await contract_manager.start()
 
-    # Return managers with cleanup
-    try:
-        yield {
-            'sync': sync_manager,
-            'tx': tx_manager,
-            'chain': chain_manager,
-            'contract': contract_manager
-        }
-    finally:
-        # Cleanup all managers
-        await asyncio.gather(
-            sync_manager.stop(),
-            tx_manager.stop(),
-            chain_manager.stop(),
-            contract_manager.stop()
-        )
+    components = {
+        'sync': sync_manager,
+        'tx': tx_manager,
+        'chain': chain_manager,
+        'contract': contract_manager
+    }
+
+    yield components
+
+    # Cleanup all managers
+    await asyncio.gather(
+        sync_manager.stop(),
+        tx_manager.stop(),
+        chain_manager.stop(),
+        contract_manager.stop()
+    )
 
 
 @pytest.mark.asyncio
 async def test_concurrent_chain_sync(managers):
     """Test synchronizing multiple chains concurrently."""
-    sync_manager = managers['sync']
+    components = managers  # No need to await since fixture is already resolved
+    sync_manager = components['sync']
 
     # Setup multiple mock Web3 instances
     chains = {}
     for i in range(3):
         chain_id = f'chain{i}'
-        web3 = AsyncMock()
-        web3.__class__ = AsyncWeb3
+        web3 = AsyncMock(spec=AsyncWeb3)
         web3.eth = AsyncMock()
         web3.eth.block_number = AsyncMock(return_value=1000)
         web3.eth.get_block = AsyncMock(return_value={
@@ -99,9 +99,9 @@ async def test_concurrent_chain_sync(managers):
 @pytest.mark.asyncio
 async def test_transaction_batch_load(managers):
     """Test processing large transaction batches."""
-    tx_manager = managers['tx']
-    web3 = AsyncMock()
-    web3.__class__ = AsyncWeb3
+    components = managers  # No need to await since fixture is already resolved
+    tx_manager = components['tx']
+    web3 = AsyncMock(spec=AsyncWeb3)
     web3.eth = AsyncMock()
     web3.eth.get_transaction_count = AsyncMock(return_value=1)
     web3.eth.send_transaction = AsyncMock()
@@ -127,12 +127,12 @@ async def test_transaction_batch_load(managers):
 @pytest.mark.asyncio
 async def test_contract_deployment_load(managers):
     """Test deploying multiple contracts concurrently."""
-    contract_manager = managers['contract']
-    chain_manager = managers['chain']
+    components = managers  # No need to await since fixture is already resolved
+    contract_manager = components['contract']
+    chain_manager = components['chain']
 
     # Setup mock Web3
-    web3 = AsyncMock()
-    web3.__class__ = AsyncWeb3
+    web3 = AsyncMock(spec=AsyncWeb3)
     web3.eth = AsyncMock()
     web3.eth.chain_id = AsyncMock(return_value=1)
     web3.eth.get_code = AsyncMock(return_value='0x123456')
@@ -178,7 +178,8 @@ async def test_contract_deployment_load(managers):
 @pytest.mark.asyncio
 async def test_chain_manager_load(managers):
     """Test chain manager under load conditions."""
-    chain_manager = managers['chain']
+    components = managers  # No need to await since fixture is already resolved
+    chain_manager = components['chain']
 
     # Configure multiple chains
     chains = {
@@ -201,18 +202,18 @@ async def test_chain_manager_load(managers):
 @pytest.mark.asyncio
 async def test_system_recovery(managers):
     """Test system recovery under load conditions."""
-    sync_manager = managers['sync']
-    chain_manager = managers['chain']
+    components = managers  # No need to await since fixture is already resolved
+    sync_manager = components['sync']
+    chain_manager = components['chain']
 
     # Simulate system crash during multi-chain sync
     chains = {
-        'chain1': AsyncMock(),
-        'chain2': AsyncMock()
+        'chain1': AsyncMock(spec=AsyncWeb3),
+        'chain2': AsyncMock(spec=AsyncWeb3)
     }
 
     try:
         for chain_id, web3 in chains.items():
-            web3.__class__ = AsyncWeb3
             web3.eth = AsyncMock()
             web3.eth.block_number = AsyncMock(return_value=1000)
             web3.eth.get_block = AsyncMock()

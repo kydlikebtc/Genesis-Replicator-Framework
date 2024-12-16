@@ -95,6 +95,18 @@ class TransactionError(BlockchainError):
         super().__init__(message, 'BCH003', details)
 
 
+class ChainConfigError(BlockchainError):
+    """Raised for blockchain configuration errors."""
+    def __init__(self, message: str, details: Optional[Dict[str, Any]] = None):
+        super().__init__(message, 'BCH005', details)
+
+
+class SyncError(BlockchainError):
+    """Raised for blockchain synchronization errors."""
+    def __init__(self, message: str, details: Optional[Dict[str, Any]] = None):
+        super().__init__(message, 'BCH004', details)
+
+
 class AgentError(GenesisError):
     """Base exception for agent-related errors."""
     def __init__(self, message: str, error_code: Optional[str] = None, details: Optional[Dict[str, Any]] = None):

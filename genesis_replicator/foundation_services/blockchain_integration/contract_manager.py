@@ -4,8 +4,8 @@ Contract Manager for blockchain integration.
 This module manages smart contract interactions, deployment, and monitoring.
 """
 import asyncio
-import json
-from typing import Dict, List, Optional, Any, AsyncGenerator
+import re
+from typing import Any, AsyncGenerator, Awaitable, Callable, Dict, List, Optional
 from web3 import AsyncWeb3, Web3
 from web3.exceptions import Web3Exception, ContractLogicError
 from web3.types import BlockData
@@ -17,19 +17,48 @@ from ...foundation_services.exceptions import (
     SecurityError,
     TransactionError
 )
+from .chain_manager import ChainManager
 
 
 class ContractManager:
     """Manages smart contract operations and monitoring."""
 
-    def __init__(self):
-        """Initialize the contract manager."""
+    def __init__(self, chain_manager: Optional[ChainManager] = None):
+        """Initialize the contract manager.
+
+        Args:
+            chain_manager: Optional ChainManager instance. If not provided, will create a new one.
+        """
+        self._chain_manager = chain_manager or ChainManager()
         self._contracts: Dict[str, Dict[str, Any]] = {}
         self._abis: Dict[str, Dict[str, Any]] = {}
         self._web3_instances: Dict[str, AsyncWeb3] = {}
         self._lock = asyncio.Lock()
         self._initialized = False
         self._deployment_semaphore = asyncio.Semaphore(5)  # Limit concurrent deployments
+
+    async def register_contract(self, contract_name: str, contract_address: str, abi: List[Dict[str, Any]], chain_id: str) -> None:
+        """Register a contract for management.
+
+        Args:
+            contract_name: Name to identify the contract
+            contract_address: Contract's deployed address
+            abi: Contract's ABI
+            chain_id: ID of the chain where contract is deployed
+        """
+        async with self._lock:
+            self._contracts[contract_name] = {
+                'address': contract_address,
+                'abi': abi,
+                'chain_id': chain_id
+            }
+            self._abis[contract_name] = abi
+
+    async def unregister_contract(self, contract_name: str) -> None:
+        """Unregister a contract from management."""
+        async with self._lock:
+            self._contracts.pop(contract_name, None)
+            self._abis.pop(contract_name, None)
 
     async def start(self) -> None:
         """Initialize and start the contract manager.
@@ -48,6 +77,16 @@ class ContractManager:
                 self._contracts.clear()
                 self._abis.clear()
                 self._web3_instances.clear()
+
+                # Initialize chain manager if needed
+                if not await self._chain_manager.is_running():
+                    await self._chain_manager.start()
+
+                # Get web3 instances from chain manager's connected chains
+                for chain_id, chain_config in self._chain_manager._chain_configs.items():
+                    if chain_config.get('protocol') == 'ethereum':
+                        self._web3_instances[chain_id] = await self._chain_manager.get_web3(chain_id)
+
         except Exception as e:
             raise ContractError(
                 "Failed to initialize contract manager",
@@ -64,15 +103,15 @@ class ContractManager:
 
     async def get_contract_state(
         self,
-        chain_id: str,
         contract_address: str,
+        chain_id: str = "default",
         sanitize: bool = True
     ) -> Dict[str, Any]:
         """Get contract state with input sanitization and validation.
 
         Args:
-            chain_id: Chain identifier
             contract_address: Contract address
+            chain_id: Chain identifier
             sanitize: Whether to sanitize inputs
 
         Returns:
@@ -145,37 +184,49 @@ class ContractManager:
                 }
             )
 
-    def _validate_input(self, input_str: str) -> bool:
-        """Validate and sanitize input strings.
+    def _validate_input(self, value: str) -> bool:
+        """Validate input to prevent injection attacks."""
+        if not isinstance(value, str):
+            return False
+        # Basic validation for hex addresses and chain IDs
+        return bool(re.match(r'^[0-9a-fA-F\-_]+$', value))
 
-        Args:
-            input_str: Input string to validate
-
-        Returns:
-            True if input is valid, False otherwise
-        """
-        import re
-        return bool(re.match(r'^[0-9a-fA-F]{40}$', input_str.replace('0x', '')))
+    async def validate_contract(self, contract_address: str, chain_id: str = "default") -> bool:
+        """Validate a contract's existence and code."""
+        try:
+            web3 = self._web3_instances[chain_id]
+            code = await web3.eth.get_code(contract_address)
+            return code != '0x' and code != b'0x' and code != b''
+        except Exception:
+            return False
 
     async def deploy_contract(
         self,
-        contract_id: str,
         contract_name: str,
-        credentials: Optional[Dict[str, Any]] = None,
+        abi: List[Dict[str, Any]],
+        bytecode: str,
         chain_id: str = "default",
         **kwargs
-    ) -> str:
+    ) -> Dict[str, Any]:
         """Deploy a new contract with verification.
 
         Args:
-            contract_id: Unique identifier for the contract
             contract_name: Name of the contract to deploy
-            credentials: Optional security credentials
-            chain_id: Chain identifier
+            abi: Contract ABI
+            bytecode: Contract bytecode
+            chain_id: Chain identifier (optional)
             **kwargs: Additional deployment parameters
 
         Returns:
-            Deployed contract address
+            Dict containing:
+                - address: Deployed contract address
+                - abi: Contract ABI
+                - bytecode: Contract bytecode
+                - chain_id: Chain identifier
+                - deployed_at: Block number of deployment
+                - owner: Contract deployer address
+                - deployment_verified: Verification status
+                - code_hash: Hash of deployed bytecode
 
         Raises:
             ContractError: If deployment fails or verification fails
@@ -187,10 +238,10 @@ class ContractManager:
         try:
             async with self._deployment_semaphore:
                 async with self._lock:
-                    if contract_id in self._contracts:
+                    if contract_name in self._contracts:
                         raise ContractError(
-                            f"Contract {contract_id} already exists",
-                            details={"contract_id": contract_id}
+                            f"Contract {contract_name} already exists",
+                            details={"contract_name": contract_name}
                         )
 
                     if chain_id not in self._web3_instances:
@@ -199,21 +250,23 @@ class ContractManager:
                             details={"chain_id": chain_id}
                         )
 
-                    # Validate credentials
-                    if not credentials or 'role' not in credentials or credentials['role'] != 'admin':
-                        raise SecurityError(
-                            "Invalid deployment credentials",
-                            details={
-                                "contract_id": contract_id,
-                                "chain_id": chain_id
-                            }
-                        )
-
                     web3 = self._web3_instances[chain_id]
 
-                    # Deploy contract (mock implementation for testing)
-                    contract_address = f"0x{contract_id}{'0' * 40}"
-                    deployment_block = await web3.eth.block_number
+                    # Deploy contract
+                    try:
+                        contract = web3.eth.contract(abi=abi, bytecode=bytecode)
+                        tx_hash = await contract.constructor().transact(**kwargs)
+                        receipt = await web3.eth.wait_for_transaction_receipt(tx_hash)
+                        contract_address = receipt['contractAddress']
+                        deployment_block = receipt['blockNumber']
+                    except Exception as e:
+                        raise ContractError(
+                            "Contract deployment failed",
+                            details={
+                                "contract_name": contract_name,
+                                "error": str(e)
+                            }
+                        )
 
                     # Verify deployment
                     max_verification_attempts = 3
@@ -228,55 +281,37 @@ class ContractManager:
                                     raise ContractError(
                                         "Contract deployment verification failed",
                                         details={
-                                            "contract_id": contract_id,
+                                            "contract_name": contract_name,
                                             "contract_address": contract_address
                                         }
                                     )
                                 await asyncio.sleep(verification_delay)
                                 continue
 
-                            # Verify contract initialization
-                            try:
-                                # Try to call a view function (e.g., owner() or name())
-                                contract = web3.eth.contract(
-                                    address=contract_address,
-                                    abi=self._abis.get(contract_name, [])
-                                )
-                                if hasattr(contract.functions, 'owner'):
-                                    await contract.functions.owner().call()
-                                elif hasattr(contract.functions, 'name'):
-                                    await contract.functions.name().call()
-                            except Exception as e:
-                                if attempt == max_verification_attempts - 1:
-                                    raise ContractError(
-                                        "Contract initialization verification failed",
-                                        details={
-                                            "contract_id": contract_id,
-                                            "error": str(e)
-                                        }
-                                    )
-                                await asyncio.sleep(verification_delay)
-                                continue
-
-                            # Store verified contract
-                            self._contracts[contract_id] = {
+                            # Store contract data
+                            contract_data = {
                                 'address': contract_address,
-                                'name': contract_name,
+                                'abi': abi,
+                                'bytecode': bytecode,
                                 'chain_id': chain_id,
                                 'deployed_at': deployment_block,
-                                'owner': kwargs.get('from_address', '0x0'),
+                                'owner': kwargs.get('from', '0x0'),
                                 'deployment_verified': True,
                                 'code_hash': web3.keccak(deployed_code).hex()
                             }
 
-                            return contract_address
+                            # Store in manager's contract registry
+                            self._contracts[contract_name] = contract_data
+
+                            # Return deployment data
+                            return contract_data
 
                         except Exception as e:
                             if attempt == max_verification_attempts - 1:
                                 raise ContractError(
                                     "Contract deployment verification failed",
                                     details={
-                                        "contract_id": contract_id,
+                                        "contract_name": contract_name,
                                         "error": str(e)
                                     }
                                 )
@@ -286,7 +321,6 @@ class ContractManager:
             raise ContractError(
                 f"Contract deployment failed: {str(e)}",
                 details={
-                    "contract_id": contract_id,
                     "contract_name": contract_name,
                     "chain_id": chain_id,
                     "error": str(e)
@@ -356,21 +390,19 @@ class ContractManager:
 
     async def call_contract_method(
         self,
-        chain_id: str,
-        web3: AsyncWeb3,
-        contract_address: str,
+        contract_name: str,
         method_name: str,
         *args,
+        chain_id: str = "default",
         **kwargs
     ) -> Any:
         """Call a contract method.
 
         Args:
-            chain_id: Chain identifier
-            web3: Web3 instance for the chain
-            contract_address: Contract address
+            contract_name: Name of the contract
             method_name: Method to call
             *args: Method arguments
+            chain_id: Chain identifier (optional)
             **kwargs: Additional call arguments
 
         Returns:
@@ -385,24 +417,29 @@ class ContractManager:
             # Validate chain connection
             if chain_id not in self._web3_instances:
                 raise ChainConnectionError(
-                    f"Chain {chain_id} not connected",
+                    "Chain not found",
                     details={"chain_id": chain_id}
                 )
 
-            # Validate contract address
-            if not self._validate_input(contract_address):
-                raise SecurityError(
-                    "Invalid contract address",
+            web3 = self._web3_instances[chain_id]
+
+            # Get contract data
+            if contract_name not in self._contracts:
+                raise ContractError(
+                    f"Contract not found: {contract_name}",
                     details={
                         "chain_id": chain_id,
-                        "contract_address": contract_address
+                        "contract_name": contract_name
                     }
                 )
 
-            # Check contract exists
-            if contract_address not in self._contracts:
+            contract_data = self._contracts[contract_name]
+            contract_address = contract_data['address']
+
+            # Validate contract address
+            if not self._validate_input(contract_address):
                 raise ContractError(
-                    f"Contract not found: {contract_address}",
+                    "Invalid contract address",
                     details={
                         "chain_id": chain_id,
                         "contract_address": contract_address
@@ -420,11 +457,20 @@ class ContractManager:
                     }
                 )
 
-            contract_data = self._contracts[contract_address]
-            contract = web3.eth.contract(
-                address=contract_address,
-                abi=contract_data['abi']
-            )
+            try:
+                contract = web3.eth.contract(
+                    address=contract_address,
+                    abi=contract_data['abi']
+                )
+            except Exception as e:
+                raise ContractError(
+                    "Contract creation failed",
+                    details={
+                        "chain_id": chain_id,
+                        "contract_address": contract_address,
+                        "error": str(e)
+                    }
+                )
 
             # Get contract method
             method = getattr(contract.functions, method_name, None)
@@ -432,47 +478,48 @@ class ContractManager:
                 raise ContractError(
                     f"Method not found: {method_name}",
                     details={
-                        "contract_address": contract_address,
+                        "contract_name": contract_name,
                         "method_name": method_name
                     }
                 )
 
-            # Call method
-            result = await method(*args).call(**kwargs)
-            return result
+            try:
+                # Call method
+                result = await method(*args).call(**kwargs)
+                return result
+            except Exception as e:
+                raise ContractError(
+                    "Contract method execution failed",
+                    details={
+                        "chain_id": chain_id,
+                        "contract_name": contract_name,
+                        "method_name": method_name,
+                        "error": str(e)
+                    }
+                )
 
         except ContractLogicError as e:
             raise ContractError(
-                f"Contract logic error: {str(e)}",
+                "Contract method execution failed",
                 details={
                     "chain_id": chain_id,
-                    "contract_address": contract_address,
+                    "contract_name": contract_name,
                     "method_name": method_name,
                     "error": str(e)
                 }
             )
         except Web3Exception as e:
             raise ContractError(
-                f"Web3 error calling contract method: {str(e)}",
+                "Contract method execution failed",
                 details={
                     "chain_id": chain_id,
-                    "contract_address": contract_address,
+                    "contract_name": contract_name,
                     "method_name": method_name,
                     "error": str(e)
                 }
             )
-        except (ChainConnectionError, SecurityError) as e:
+        except (ChainConnectionError, SecurityError, ContractError) as e:
             raise e
-        except Exception as e:
-            raise ContractError(
-                f"Unexpected error calling contract method: {str(e)}",
-                details={
-                    "chain_id": chain_id,
-                    "contract_address": contract_address,
-                    "method_name": method_name,
-                    "error": str(e)
-                }
-            )
 
     async def send_transaction(
         self,
@@ -610,19 +657,21 @@ class ContractManager:
         chain_id: str,
         contract_address: str,
         event_name: str,
+        callback: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
         from_block: Optional[int] = None,
         to_block: Optional[int] = None,
         batch_size: int = 1000,
         filters: Optional[Dict[str, Any]] = None,
         retry_interval: int = 5,
         max_retries: int = 3
-    ) -> AsyncGenerator[Dict[str, Any], None]:
+    ) -> Optional[AsyncGenerator[Dict[str, Any], None]]:
         """Monitor contract events with enhanced filtering and backfilling.
 
         Args:
             chain_id: Chain identifier
             contract_address: Contract address to monitor
             event_name: Event name to monitor
+            callback: Optional async callback function for events
             from_block: Starting block number (default: latest - 1000)
             to_block: Ending block number (default: latest)
             batch_size: Number of blocks to process in each batch
@@ -630,12 +679,8 @@ class ContractManager:
             retry_interval: Seconds between retry attempts
             max_retries: Maximum number of retry attempts
 
-        Yields:
-            Event data dictionaries with enhanced information including:
-            - Event details (name, args, etc.)
-            - Block information (number, hash, timestamp)
-            - Transaction details (hash, gas used, status)
-            - Contract context (address, chain)
+        Returns:
+            AsyncGenerator if no callback provided, None if callback is used
 
         Raises:
             ContractError: If event monitoring fails
@@ -693,7 +738,7 @@ class ContractManager:
             end_block = to_block if to_block is not None else latest_block
 
             # Process events in batches with enhanced retry logic
-            async def monitor():
+            async def process_events():
                 current_block = start_block
                 while current_block <= end_block:
                     batch_end = min(current_block + batch_size, end_block)
@@ -720,7 +765,7 @@ class ContractManager:
                                 block = await web3.eth.get_block(evt.blockNumber)
                                 tx_receipt = await web3.eth.get_transaction_receipt(evt.transactionHash)
 
-                                yield {
+                                event_data = {
                                     'event': event_name,
                                     'args': dict(evt.args),
                                     'block_number': evt.blockNumber,
@@ -733,6 +778,12 @@ class ContractManager:
                                     'status': tx_receipt.status,
                                     'contract_address': contract_address
                                 }
+
+                                if callback:
+                                    await callback(event_data)
+                                else:
+                                    yield event_data
+
                             break  # Success, exit retry loop
 
                         except Exception as e:
@@ -746,8 +797,14 @@ class ContractManager:
 
                     current_block = batch_end + 1
 
-            async for event_data in monitor():
-                yield event_data
+            if callback:
+                # Create monitoring task and start it
+                task = asyncio.create_task(process_events())
+                asyncio.create_task(self._manage_monitoring_task(task))
+                return None
+            else:
+                # Return the generator for direct iteration
+                return process_events()
 
         except Exception as e:
             raise ContractError(
@@ -759,6 +816,19 @@ class ContractManager:
                     "error": str(e)
                 }
             )
+
+    async def _manage_monitoring_task(self, task: asyncio.Task) -> None:
+        """Manage a monitoring task and handle its completion.
+
+        Args:
+            task: The monitoring task to manage
+        """
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            print(f"Monitoring task failed: {str(e)}")
 
     async def get_contract_events(
         self,

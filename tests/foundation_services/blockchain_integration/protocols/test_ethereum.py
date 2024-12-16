@@ -6,8 +6,9 @@ import asyncio
 from unittest.mock import AsyncMock, patch
 from web3 import AsyncWeb3
 
+from genesis_replicator.foundation_services.blockchain_integration.protocols.base import BaseProtocolAdapter
 from genesis_replicator.foundation_services.blockchain_integration.protocols.ethereum import EthereumAdapter
-from genesis_replicator.foundation_services.blockchain_integration.exceptions import ChainConnectionError, ConfigurationError
+from genesis_replicator.foundation_services.blockchain_integration.exceptions import ChainConnectionError, ChainConfigError
 
 @pytest.fixture(scope="function")
 def event_loop():
@@ -20,42 +21,26 @@ def event_loop():
     asyncio.set_event_loop(None)
 
 @pytest.fixture
-def web3_mock():
+async def web3_mock(base_web3_mock):
     """Create a mock Web3 instance."""
-    # Create base mock
-    mock = AsyncMock()
-    mock.__class__ = AsyncWeb3
-    mock.eth = AsyncMock()
+    mock = base_web3_mock
 
-    # Configure eth mock methods to return awaitable results
-    mock.eth.chain_id = AsyncMock(return_value=1)
-    mock.eth.get_balance = AsyncMock(return_value=1000000)
+    # Add Ethereum protocol specific mock methods
     mock.eth.gas_price = AsyncMock(return_value=20000000000)
     mock.eth.estimate_gas = AsyncMock(return_value=21000)
-    mock.eth.get_transaction_receipt = AsyncMock(return_value={
-        'status': 1,
-        'transactionHash': '0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef',
-        'blockNumber': 1000,
-        'gasUsed': 21000
-    })
-    mock.eth.get_block = AsyncMock(return_value={
-        'number': 1000,
-        'timestamp': 1234567890,
-        'hash': '0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef',
-        'baseFeePerGas': 1000000000
-    })
     mock.eth.send_transaction = AsyncMock(
         return_value='0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef'
     )
-    mock.eth.contract = AsyncMock()
-    mock.is_connected = AsyncMock(return_value=True)
     mock.is_address = AsyncMock(return_value=True)
+
     return mock
 
 @pytest.fixture
-def ethereum_adapter():
+async def ethereum_adapter():
     """Create an Ethereum adapter instance."""
-    return EthereumAdapter()
+    adapter = EthereumAdapter()
+    await adapter.start()
+    return adapter
 
 @pytest.mark.asyncio
 async def test_web3_configuration(ethereum_adapter, web3_mock):
@@ -142,15 +127,14 @@ async def test_get_block(ethereum_adapter, web3_mock):
 async def test_configuration_error():
     """Test configuration error handling."""
     adapter = EthereumAdapter()
-    with pytest.raises(ConfigurationError):
+    with pytest.raises(ChainConfigError):
         await adapter.configure_web3('')
 
 @pytest.mark.asyncio
 async def test_chain_connection_error():
     """Test chain connection error handling."""
     adapter = EthereumAdapter()
-    mock = AsyncMock()
-    mock.__class__ = AsyncWeb3
+    mock = AsyncMock(spec=AsyncWeb3)
     mock.is_connected = AsyncMock(return_value=False)
     with patch('web3.AsyncWeb3', return_value=mock):
         with pytest.raises(ChainConnectionError):

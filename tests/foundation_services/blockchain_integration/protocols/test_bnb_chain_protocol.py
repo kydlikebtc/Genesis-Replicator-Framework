@@ -68,7 +68,7 @@ async def test_bnb_chain_gas_estimation(bnb_chain_adapter, web3_mock):
 @pytest.mark.asyncio
 async def test_bnb_chain_transaction_batch(bnb_chain_adapter, web3_mock):
     """Test BNB Chain transaction batch processing."""
-    processor = BatchProcessor()
+    processor = BatchProcessor(max_batch_size=50, max_concurrent=3)
 
     # Configure batch processor for BNB Chain
     await processor.configure_chain(
@@ -91,14 +91,15 @@ async def test_bnb_chain_transaction_batch(bnb_chain_adapter, web3_mock):
         transactions.append(tx)
 
     # Process transactions
-    results = []
-    for tx in transactions:
-        await processor.add_transaction(tx)
+    async def process_tx(tx):
+        return await bnb_chain_adapter.send_transaction(tx)
 
-    async for result in processor.process_batch():
+    results = []
+    async for result in processor.process_batch(transactions, process_tx):
         results.append(result)
 
     assert len(results) == 10
+    assert all(r['success'] for r in results)
 
 @pytest.mark.asyncio
 async def test_bnb_chain_event_monitoring(bnb_chain_adapter, web3_mock):

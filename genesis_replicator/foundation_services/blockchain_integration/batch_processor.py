@@ -4,7 +4,7 @@ Batch transaction processor for blockchain operations.
 This module handles batching and processing of blockchain transactions.
 """
 import asyncio
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Callable, AsyncGenerator
 from web3 import AsyncWeb3
 from web3.exceptions import Web3Exception
 
@@ -17,14 +17,21 @@ from ...foundation_services.exceptions import (
 class BatchProcessor:
     """Handles batching and processing of blockchain transactions."""
 
-    def __init__(self):
-        """Initialize the batch processor."""
-        self._batch_size = 10
+    def __init__(self, max_batch_size: int = 10, max_concurrent: int = 3):
+        """Initialize the batch processor.
+
+        Args:
+            max_batch_size: Maximum number of transactions per batch
+            max_concurrent: Maximum number of concurrent transactions
+        """
+        self._batch_size = max_batch_size
+        self._max_concurrent = max_concurrent
         self._batch_interval = 1.0  # seconds
         self._max_retries = 3
         self._processing = False
         self._batch_queue: List[Dict[str, Any]] = []
         self._lock = asyncio.Lock()
+        self._semaphore = asyncio.Semaphore(max_concurrent)
 
     async def add_transaction(self, transaction: Dict[str, Any]) -> None:
         """Add a transaction to the batch queue.
@@ -37,39 +44,81 @@ class BatchProcessor:
         """
         async with self._lock:
             self._batch_queue.append(transaction)
-            if len(self._batch_queue) >= self._batch_size and not self._processing:
-                await self._process_batch()
 
-    async def _process_batch(self) -> None:
-        """Process a batch of transactions."""
-        try:
-            self._processing = True
+    async def process_batch(
+        self,
+        transactions: Optional[List[Dict[str, Any]]] = None,
+        process_func: Optional[Callable[[Dict[str, Any]], Any]] = None
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Process a batch of transactions.
+
+        Args:
+            transactions: Optional list of transactions to process
+            process_func: Optional function to process each transaction
+
+        Yields:
+            Dict containing transaction result
+        """
+        if transactions:
+            self._batch_queue.extend(transactions)
+
+        while self._batch_queue:
             batch = self._batch_queue[:self._batch_size]
             self._batch_queue = self._batch_queue[self._batch_size:]
 
-            # Process transactions in parallel
-            tasks = [
-                self._send_transaction(tx)
-                for tx in batch
-            ]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
+            tasks = []
+            for tx in batch:
+                task = asyncio.create_task(self._process_transaction(tx, process_func))
+                tasks.append(task)
 
-            # Handle results
-            for tx, result in zip(batch, results):
-                if isinstance(result, Exception):
-                    print(f"Transaction failed: {str(result)}")
-                    # Add to retry queue if retries remaining
-                    if tx.get('retries', 0) < self._max_retries:
-                        tx['retries'] = tx.get('retries', 0) + 1
-                        self._batch_queue.append(tx)
+            for result in asyncio.as_completed(tasks):
+                try:
+                    tx_result = await result
+                    yield {
+                        'success': True,
+                        'result': tx_result
+                    }
+                except Exception as e:
+                    yield {
+                        'success': False,
+                        'error': str(e)
+                    }
 
-        except Exception as e:
-            raise TransactionError(
-                f"Batch processing failed: {str(e)}",
-                details={"error": str(e)}
-            )
-        finally:
-            self._processing = False
+    async def _process_transaction(
+        self,
+        transaction: Dict[str, Any],
+        process_func: Optional[Callable[[Dict[str, Any]], Any]] = None
+    ) -> Any:
+        """Process a single transaction with retry logic.
+
+        Args:
+            transaction: Transaction to process
+            process_func: Optional function to process the transaction
+
+        Returns:
+            Transaction result
+
+        Raises:
+            TransactionError: If transaction processing fails after retries
+        """
+        retries = 0
+        while retries < self._max_retries:
+            try:
+                async with self._semaphore:
+                    if process_func:
+                        return await process_func(transaction)
+                    return await self._send_transaction(transaction)
+            except Exception as e:
+                retries += 1
+                if retries >= self._max_retries:
+                    raise TransactionError(
+                        f"Transaction failed after {retries} retries: {str(e)}",
+                        details={
+                            "transaction": transaction,
+                            "error": str(e)
+                        }
+                    )
+                await asyncio.sleep(self._batch_interval)
 
     async def _send_transaction(self, transaction: Dict[str, Any]) -> str:
         """Send a single transaction.
@@ -95,13 +144,6 @@ class BatchProcessor:
                     "error": str(e)
                 }
             )
-
-    async def start(self) -> None:
-        """Start the batch processor."""
-        while True:
-            await asyncio.sleep(self._batch_interval)
-            if self._batch_queue and not self._processing:
-                await self._process_batch()
 
     async def configure_chain(
         self,

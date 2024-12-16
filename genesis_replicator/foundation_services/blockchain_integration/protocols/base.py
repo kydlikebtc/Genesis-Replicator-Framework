@@ -17,9 +17,37 @@ class BaseProtocolAdapter(ABC):
         self.block_time: int = 0  # Average block time in seconds
 
     @abstractmethod
-    async def configure_web3(self, provider_url: str) -> None:
+    async def configure_web3(self, provider_url: str) -> Web3:
         """Configure Web3 instance for the protocol."""
         pass
+
+    async def get_test_web3(self) -> Web3:
+        """Get a mock Web3 instance for testing.
+
+        Returns:
+            Web3: A mock Web3 instance configured for testing
+        """
+        from unittest.mock import AsyncMock, MagicMock
+
+        # Create mock Web3 instance
+        mock_web3 = MagicMock()
+
+        # Mock common attributes and methods
+        mock_web3.eth = AsyncMock()
+        mock_web3.eth.chain_id = 1
+        mock_web3.eth.get_block_number = AsyncMock(return_value=1000)
+        mock_web3.eth.get_balance = AsyncMock(return_value=1000000000000000000)
+        mock_web3.eth.get_transaction_count = AsyncMock(return_value=1)
+        mock_web3.eth.get_gas_price = AsyncMock(return_value=20000000000)
+        mock_web3.eth.estimate_gas = AsyncMock(return_value=21000)
+        mock_web3.eth.send_raw_transaction = AsyncMock(return_value=b'0x...')
+        mock_web3.eth.wait_for_transaction_receipt = AsyncMock(return_value={
+            'status': 1,
+            'blockNumber': 1000,
+            'gasUsed': 21000
+        })
+
+        return mock_web3
 
     @abstractmethod
     async def estimate_gas(self, tx_params: TxParams) -> Wei:
